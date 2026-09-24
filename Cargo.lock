@@ -3315,15 +3315,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zakura-grpc"
-version = "0.1.0"
-dependencies = [
- "zakura-grpc-client",
- "zakura-grpc-geyser",
- "zakura-grpc-proto",
-]
-
-[[package]]
 name = "zakura-grpc-client"
 version = "0.1.0"
 dependencies = [
