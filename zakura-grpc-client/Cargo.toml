@@ -1,0 +1,19 @@
+[package]
+name = "zakura-grpc-client"
+version.workspace = true
+authors.workspace = true
+description = "Rust client for Zakura Geyser gRPC"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+zakura-grpc-proto = { workspace = true }
+
+[lints]
+workspace = true
+

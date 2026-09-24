@@ -1,0 +1,32 @@
+[package]
+name = "zakura-grpc-geyser"
+version.workspace = true
+authors.workspace = true
+description = "Zakura Geyser plugin with Yellowstone-style gRPC streaming"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+futures-core = { workspace = true }
+metrics = { workspace = true }
+parking_lot = { workspace = true }
+prost-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
+tonic-health = { workspace = true }
+tracing = { workspace = true }
+zakura-chain = { workspace = true }
+zakura-geyser-plugin-interface = { workspace = true }
+zakura-geyser-plugin-manager = { workspace = true }
+zakura-grpc-proto = { workspace = true }
+
+[lints]
+workspace = true
+

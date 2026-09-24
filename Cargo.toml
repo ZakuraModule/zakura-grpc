@@ -1,0 +1,73 @@
+[package]
+name = "zakura-grpc"
+version.workspace = true
+authors.workspace = true
+description = "Compatibility facade for the Zakura gRPC crates"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+keywords = ["zakura", "zcash", "geyser", "grpc"]
+autobins = false
+
+[workspace]
+members = [
+    "examples/rust",
+    "zakura-grpc-client",
+    "zakura-grpc-geyser",
+    "zakura-grpc-proto",
+]
+resolver = "2"
+
+[workspace.package]
+authors = ["Zakura Contributors"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ZakuraModule/zakura-grpc"
+rust-version = "1.97"
+version = "0.1.0"
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+futures-core = "0.3"
+metrics = "0.24"
+parking_lot = "0.12"
+prost = "0.14"
+prost-types = "0.14"
+protoc-bin-vendored = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = "0.7"
+tonic = { version = "0.14", features = ["transport"] }
+tonic-health = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tracing = "0.1"
+
+zakura-chain = { path = "../zakura/crates/zakura-chain", version = "8.0.0" }
+zakura-geyser-plugin-interface = { path = "../zakura/crates/zakura-geyser-plugin-interface", version = "0.1.0" }
+zakura-geyser-plugin-manager = { path = "../zakura/crates/zakura-geyser-plugin-manager", version = "0.1.0" }
+zakura-grpc-client = { path = "zakura-grpc-client", version = "0.1.0" }
+zakura-grpc-geyser = { path = "zakura-grpc-geyser", version = "0.1.0" }
+zakura-grpc-proto = { path = "zakura-grpc-proto", version = "0.1.0" }
+
+[dependencies]
+zakura-grpc-client = { workspace = true }
+zakura-grpc-geyser = { workspace = true }
+zakura-grpc-proto = { workspace = true }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[lints]
+workspace = true
