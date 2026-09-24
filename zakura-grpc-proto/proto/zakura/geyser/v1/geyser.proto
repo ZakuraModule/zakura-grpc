@@ -25,10 +25,19 @@ message SubscribeRequest {
   // Replays retained block-scoped events starting at this height, then follows live events.
   optional uint32 from_height = 2;
   optional SubscribeRequestPing ping = 3;
+  // Named filters let one update report every client filter it matched.
+  map<string, SubscribeRequestFilter> filters = 4;
 }
 
 message SubscribeRequestPing {
   int32 id = 1;
+}
+
+message SubscribeRequestFilter {
+  // An empty list matches every event type.
+  repeated EventType event_types = 1;
+  // Ignore block-scoped events below this height.
+  optional uint32 min_height = 2;
 }
 
 message SubscribeUpdate {
@@ -37,6 +46,8 @@ message SubscribeUpdate {
   uint64 sequence = 3;
   google.protobuf.Timestamp observed_at = 4;
   EventType event_type = 5;
+  // Names from SubscribeRequest.filters which matched this update.
+  repeated string filters = 6;
 
   oneof update {
     BlockUpdate block = 10;
@@ -111,4 +122,3 @@ message GetVersionResponse {
   uint32 interface_version = 2;
   uint32 event_schema_version = 3;
 }
-

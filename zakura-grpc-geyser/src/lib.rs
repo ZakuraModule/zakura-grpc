@@ -3,13 +3,15 @@
 //! The plugin keeps a bounded in-memory replay window for reconnects and never
 //! puts socket backpressure on Zakura's state or consensus tasks.
 
+mod auth;
 mod config;
 mod event;
+mod filter;
 mod server;
 
-use std::{fmt, net::TcpListener as StdTcpListener, sync::Arc};
+use std::{fmt, net::TcpListener as StdTcpListener, sync::Arc, time::Duration};
 
-pub use config::{Config, ConfigError};
+pub use config::{Compression, CompressionConfig, Config, ConfigError, FilterLimits};
 use server::{GrpcService, SharedState};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -105,15 +107,31 @@ impl GeyserPlugin for GrpcPlugin {
 
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();
-        let service = GrpcService::new(Arc::clone(&self.state))
-            .into_server(self.config.max_decoding_message_size);
+        let service =
+            GrpcService::new(Arc::clone(&self.state), &self.config).into_server(&self.config);
         let listen_addr = self.config.listen_addr;
+        let adaptive_window = self.config.server_http2_adaptive_window;
+        let keepalive_interval = self
+            .config
+            .server_http2_keepalive_interval_ms
+            .map(Duration::from_millis);
+        let keepalive_timeout = self
+            .config
+            .server_http2_keepalive_timeout_ms
+            .map(Duration::from_millis);
+        let connection_window = self.config.server_initial_connection_window_size;
+        let stream_window = self.config.server_initial_stream_window_size;
         self.server = Some(runtime.spawn(async move {
             let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
             server::mark_serving(&mut health_reporter).await;
             info!(%listen_addr, "Zakura gRPC plugin listening");
 
             let result = Server::builder()
+                .http2_adaptive_window(adaptive_window)
+                .http2_keepalive_interval(keepalive_interval)
+                .http2_keepalive_timeout(keepalive_timeout)
+                .initial_connection_window_size(connection_window)
+                .initial_stream_window_size(stream_window)
                 .add_service(health_service)
                 .add_service(service)
                 .serve_with_incoming_shutdown(

@@ -50,6 +50,7 @@ pub(crate) fn encode_event(event: &EventEnvelope) -> Result<SubscribeUpdate, Plu
         sequence: event.sequence,
         observed_at: Some(timestamp(event.observed_at)),
         event_type: event_type.into(),
+        filters: Vec::new(),
         update: Some(update),
     })
 }

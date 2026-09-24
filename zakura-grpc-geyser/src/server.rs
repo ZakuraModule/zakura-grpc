@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashSet, VecDeque},
-    pin::Pin,
-    sync::Arc,
-};
+use std::{collections::VecDeque, pin::Pin, sync::Arc};
 
 use futures_core::Stream;
 use parking_lot::Mutex;
@@ -17,7 +13,12 @@ use zakura_grpc_proto::geyser::{
     SubscribeUpdate,
 };
 
-use crate::{config::Config, event::block_height};
+use crate::{
+    auth::{SubscriptionTracker, TokenAuth},
+    config::{Config, FilterLimits},
+    event::block_height,
+    filter::EventFilter,
+};
 
 type SubscribeResult = Result<SubscribeUpdate, Status>;
 
@@ -149,15 +150,35 @@ struct ReplaySnapshot {
 #[derive(Clone)]
 pub(crate) struct GrpcService {
     state: Arc<SharedState>,
+    auth: TokenAuth,
+    subscriptions: SubscriptionTracker,
+    filter_limits: Arc<FilterLimits>,
 }
 
 impl GrpcService {
-    pub(crate) fn new(state: Arc<SharedState>) -> Self {
-        Self { state }
+    pub(crate) fn new(state: Arc<SharedState>, config: &Config) -> Self {
+        Self {
+            state,
+            auth: TokenAuth::new(config.x_token.clone()),
+            subscriptions: SubscriptionTracker::new(
+                config.subscription_limit,
+                config.subscription_limit_enforce,
+            ),
+            filter_limits: Arc::new(config.filter_limits.clone()),
+        }
     }
 
-    pub(crate) fn into_server(self, max_decoding_message_size: usize) -> GeyserServer<Self> {
-        GeyserServer::new(self).max_decoding_message_size(max_decoding_message_size)
+    pub(crate) fn into_server(self, config: &Config) -> GeyserServer<Self> {
+        let mut server = GeyserServer::new(self)
+            .max_decoding_message_size(config.max_decoding_message_size)
+            .max_encoding_message_size(config.max_encoding_message_size);
+        for encoding in &config.compression.accept {
+            server = server.accept_compressed((*encoding).into());
+        }
+        for encoding in &config.compression.send {
+            server = server.send_compressed((*encoding).into());
+        }
+        server
     }
 }
 
@@ -169,20 +190,23 @@ impl Geyser for GrpcService {
         &self,
         request: Request<Streaming<SubscribeRequest>>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        self.auth.authorize(&request)?;
+        let subscription_guard = self.subscriptions.acquire(&request)?;
         let mut inbound = request.into_inner();
         let initial = inbound
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("the first subscribe request is required"))?;
-        let mut filter = EventFilter::try_from(&initial)?;
+        let mut filter = EventFilter::new(&initial, &self.filter_limits)?;
         let (mut live, replay) = self.state.subscribe(initial.from_height)?;
         let (outbound_tx, outbound_rx) = mpsc::channel(self.state.client_channel_capacity);
+        let filter_limits = Arc::clone(&self.filter_limits);
 
         metrics::counter!("plugin.grpc.connections.total").increment(1);
         tokio::spawn(async move {
+            let _subscription_guard = subscription_guard;
             for update in replay.updates {
-                if filter.matches(&update) && outbound_tx.send(Ok((*update).clone())).await.is_err()
-                {
+                if !send_filtered(&outbound_tx, &filter, &update).await {
                     return;
                 }
             }
@@ -203,7 +227,7 @@ impl Geyser for GrpcService {
                                         break;
                                     }
                                 } else {
-                                    match EventFilter::try_from(&request) {
+                                    match EventFilter::new(&request, &filter_limits) {
                                         Ok(updated_filter) => filter = updated_filter,
                                         Err(status) => {
                                             let _ = outbound_tx.send(Err(status)).await;
@@ -229,9 +253,7 @@ impl Geyser for GrpcService {
                                     continue;
                                 }
                                 replay_watermark = update.sequence;
-                                if filter.matches(&update)
-                                    && outbound_tx.send(Ok((*update).clone())).await.is_err()
-                                {
+                                if !send_filtered(&outbound_tx, &filter, &update).await {
                                     break;
                                 }
                             }
@@ -257,12 +279,14 @@ impl Geyser for GrpcService {
 
     async fn subscribe_replay_info(
         &self,
-        _request: Request<SubscribeReplayInfoRequest>,
+        request: Request<SubscribeReplayInfoRequest>,
     ) -> Result<Response<SubscribeReplayInfoResponse>, Status> {
+        self.auth.authorize(&request)?;
         Ok(Response::new(self.state.replay_info()))
     }
 
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PongResponse>, Status> {
+        self.auth.authorize(&request)?;
         Ok(Response::new(PongResponse {
             count: request.into_inner().count,
         }))
@@ -270,8 +294,9 @@ impl Geyser for GrpcService {
 
     async fn get_version(
         &self,
-        _request: Request<GetVersionRequest>,
+        request: Request<GetVersionRequest>,
     ) -> Result<Response<GetVersionResponse>, Status> {
+        self.auth.authorize(&request)?;
         Ok(Response::new(GetVersionResponse {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             interface_version: zakura_geyser_plugin_interface::GEYSER_INTERFACE_VERSION,
@@ -280,29 +305,26 @@ impl Geyser for GrpcService {
     }
 }
 
-struct EventFilter {
-    kinds: HashSet<i32>,
-}
-
-impl EventFilter {
-    fn try_from(request: &SubscribeRequest) -> Result<Self, Status> {
-        for kind in &request.event_types {
-            let parsed = EventType::try_from(*kind)
-                .map_err(|_| Status::invalid_argument(format!("unknown event type {kind}")))?;
-            if parsed == EventType::Unspecified {
-                return Err(Status::invalid_argument(
-                    "EVENT_TYPE_UNSPECIFIED cannot be used as a filter",
-                ));
-            }
-        }
-        Ok(Self {
-            kinds: request.event_types.iter().copied().collect(),
-        })
+async fn send_filtered(
+    outbound: &mpsc::Sender<SubscribeResult>,
+    filter: &EventFilter,
+    update: &SubscribeUpdate,
+) -> bool {
+    let Some(names) = filter.matched_names(update) else {
+        return true;
+    };
+    let mut update = update.clone();
+    update.filters = names;
+    let event_type = update.event_type.to_string();
+    if outbound.send(Ok(update)).await.is_err() {
+        return false;
     }
-
-    fn matches(&self, update: &SubscribeUpdate) -> bool {
-        self.kinds.is_empty() || self.kinds.contains(&update.event_type)
-    }
+    metrics::counter!(
+        "plugin.grpc.messages_sent.total",
+        "event" => event_type
+    )
+    .increment(1);
+    true
 }
 
 pub(crate) async fn mark_serving(reporter: &mut tonic_health::server::HealthReporter) {
@@ -350,11 +372,5 @@ mod tests {
 
         let status = replay.snapshot(Some(20)).unwrap_err();
         assert_eq!(status.code(), tonic::Code::OutOfRange);
-    }
-
-    #[test]
-    fn empty_event_filter_matches_everything() {
-        let filter = EventFilter::try_from(&SubscribeRequest::default()).unwrap();
-        assert!(filter.matches(&block_update(1, 1)));
     }
 }
