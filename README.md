@@ -76,7 +76,7 @@ compression = { accept = ["gzip", "zstd"], send = ["gzip", "zstd"] }
 # x_token = "replace-me"
 subscription_limit = 1000
 subscription_limit_enforce = false
-filter_limits = { max_named_filters = 32, max_event_types = 6, max_name_bytes = 128, allow_all = true }
+filter_limits = { max_named_filters = 32, max_event_types = 6, max_name_bytes = 128, max_transaction_ids = 256, max_transparent_addresses = 256, allow_all = true }
 server_http2_adaptive_window = true
 # server_http2_keepalive_interval_ms = 30000
 # server_http2_keepalive_timeout_ms = 10000
@@ -121,6 +121,22 @@ cargo run -p zakura-grpc-client-example -- \
   --endpoint http://127.0.0.1:10000 subscribe \
   --event transaction --filter-name transactions --reconnect
 ```
+
+Filter transaction updates for one wallet address without sending unrelated
+transactions to the client:
+
+```sh
+cargo run -p zakura-grpc-client-example -- \
+  --endpoint http://127.0.0.1:10000 subscribe \
+  --event transaction --filter-name wallet \
+  --address tmWbBGi7TjExNmLZyMcFpxVh3ZPbGrpbX3H --reconnect
+```
+
+`--address` and `--transaction-id` are repeatable. Address filters match
+decoded transparent inputs when verified previous-output context is available,
+and decoded transparent outputs. TEX filters are normalized to the equivalent
+P2PKH transparent address because the on-chain script does not retain whether
+the sender used a TEX encoding.
 
 Stream transparent outputs created and previous outpoints spent by each
 transaction:
@@ -178,10 +194,12 @@ height has been evicted, the server returns `OUT_OF_RANGE`; clients can query
 - Full block payloads contain consensus-encoded Zcash block bytes.
 - Transaction payloads contain consensus-encoded transaction bytes, txid,
   unmined ID, optional ZIP-244 auth digest, block position, commitment, and
-  decoded transparent inputs/outputs. A previous-output input identifies its
-  outpoint but cannot include the spent value without verified state context.
+  decoded transparent inputs/outputs. Recognized P2PKH/P2SH outputs include
+  their network-correct address. Inputs include the previous value, script,
+  address, creation height, and coinbase flag when verified context is
+  available.
 - UTXO payloads contain ordered transparent create/spend effects. Spend updates
-  identify the previous outpoint but do not repeat the previous output value.
+  carry the same optional verified previous-output context.
 - Binary protobuf fields use reference-counted buffers, so cloning an update for
   replay and multiple subscribers does not copy block, transaction, or script
   bytes. Transaction and UTXO views are produced in the same transaction pass.
@@ -202,3 +220,8 @@ unary methods are intentionally not mirrored. Zakura UTXO updates model the
 transparent UTXO effects of Zcash transactions rather than Solana accounts.
 Durable historical replay should remain a separate Kafka or storage consumer
 so consensus and state tasks never wait for it.
+
+Checkpoint-verified or restored blocks do not always retain spent-output
+context. In those updates the `previous_*` fields and aggregate transparent
+input value are absent. Indexers should always retain the outpoint and can join
+it against their own UTXO history.

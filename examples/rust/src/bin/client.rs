@@ -53,6 +53,12 @@ enum Command {
         /// Ignore block-scoped updates below this height inside the named filter.
         #[arg(long, requires = "filter_name")]
         min_height: Option<u32>,
+        /// Match one transaction ID; repeat to match multiple IDs.
+        #[arg(long, requires = "filter_name")]
+        transaction_id: Vec<String>,
+        /// Match one transparent address; repeat to match multiple addresses.
+        #[arg(long, requires = "filter_name")]
+        address: Vec<String>,
     },
     /// Show the process-local replay range.
     ReplayInfo,
@@ -110,6 +116,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             reconnect,
             filter_name,
             min_height,
+            transaction_id,
+            address,
         } => {
             if reconnect {
                 builder = builder.set_reconnect_config(ReconnectConfig::default());
@@ -127,6 +135,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         SubscribeRequestFilter {
                             event_types,
                             min_height,
+                            transaction_ids: transaction_id,
+                            transparent_addresses: address,
                         },
                     )]),
                 ),
@@ -217,17 +227,22 @@ fn print_update(update: &SubscribeUpdate) {
             for change in &utxo.changes {
                 match change.change.as_ref() {
                     Some(utxo_change::Change::Created(created)) => println!(
-                        "  created outpoint={} value_zat={} lock_script_bytes={}",
+                        "  created outpoint={} value_zat={} address={} lock_script_bytes={}",
                         format_outpoint(created.outpoint.as_ref()),
                         created.value_zat,
+                        created.address.as_deref().unwrap_or("non-standard"),
                         created.lock_script.len()
                     ),
                     Some(utxo_change::Change::Spent(spent)) => println!(
-                        "  spent outpoint={} input_index={} sequence={} unlock_script_bytes={}",
+                        "  spent outpoint={} input_index={} sequence={} unlock_script_bytes={} previous_value_zat={:?} previous_address={} previous_height={:?} previous_from_coinbase={:?}",
                         format_outpoint(spent.outpoint.as_ref()),
                         spent.input_index,
                         spent.sequence,
-                        spent.unlock_script.len()
+                        spent.unlock_script.len(),
+                        spent.previous_value_zat,
+                        spent.previous_address.as_deref().unwrap_or("unavailable"),
+                        spent.previous_height,
+                        spent.previous_from_coinbase
                     ),
                     None => println!("  utxo_change payload=none"),
                 }
@@ -249,31 +264,42 @@ fn print_transaction_update(
     transaction: &TransactionUpdate,
 ) {
     println!(
-        "sequence={} source_sequence={} event={} filters={:?} commitment={} height={} block={} transaction_index={} transaction_id={} unmined_transaction_id={} auth_digest={} transaction_bytes={} coinbase={} transparent_inputs={} transparent_outputs={}",
+        "sequence={} source_sequence={} event={} filters={:?} commitment={} network={} height={} block={} transaction_index={} transaction_id={} unmined_transaction_id={} auth_digest={} version={} lock_time={} lock_time_is_time={} expiry_height={:?} transaction_bytes={} coinbase={} transparent_inputs={} transparent_outputs={} transparent_input_value_zat={:?} transparent_output_value_zat={}",
         update.sequence,
         update.source_sequence,
         event_type,
         update.filters,
         commitment_name(transaction.commitment),
+        transaction.network,
         transaction.height,
         transaction.block_hash,
         transaction.transaction_index,
         transaction.transaction_id,
         transaction.unmined_transaction_id,
         transaction.auth_digest.as_deref().unwrap_or("none"),
+        transaction.version,
+        transaction.lock_time,
+        transaction.lock_time_is_time,
+        transaction.expiry_height,
         transaction.transaction.len(),
         transaction.coinbase,
         transaction.transparent_inputs.len(),
-        transaction.transparent_outputs.len()
+        transaction.transparent_outputs.len(),
+        transaction.transparent_input_value_zat,
+        transaction.transparent_output_value_zat
     );
     for input in &transaction.transparent_inputs {
         match input.input.as_ref() {
             Some(transparent_input::Input::Prevout(prevout)) => println!(
-                "  input index={} prevout={} sequence={} unlock_script_bytes={}",
+                "  input index={} prevout={} sequence={} unlock_script_bytes={} previous_value_zat={:?} previous_address={} previous_height={:?} previous_from_coinbase={:?}",
                 input.input_index,
                 format_outpoint(prevout.previous_output.as_ref()),
                 input.sequence,
-                prevout.unlock_script.len()
+                prevout.unlock_script.len(),
+                prevout.previous_value_zat,
+                prevout.previous_address.as_deref().unwrap_or("unavailable"),
+                prevout.previous_height,
+                prevout.previous_from_coinbase
             ),
             Some(transparent_input::Input::Coinbase(coinbase)) => println!(
                 "  input index={} coinbase_height={} sequence={} data_bytes={}",
@@ -287,9 +313,10 @@ fn print_transaction_update(
     }
     for output in &transaction.transparent_outputs {
         println!(
-            "  output index={} value_zat={} lock_script_bytes={}",
+            "  output index={} value_zat={} address={} lock_script_bytes={}",
             output.output_index,
             output.value_zat,
+            output.address.as_deref().unwrap_or("non-standard"),
             output.lock_script.len()
         );
     }

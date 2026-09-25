@@ -1,8 +1,12 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use bytes::Bytes;
 use prost_types::Timestamp;
 use zakura_chain::{
+    parameters::Network,
     serialization::ZcashSerialize,
     transaction::{self, Transaction},
     transparent,
@@ -104,9 +108,13 @@ fn append_block_updates(
             transaction_inputs,
             transaction_outputs,
             utxo_changes,
+            transparent_input_value_zat,
+            transparent_output_value_zat,
         } = encode_transparent_updates(
             transaction,
             transaction_id,
+            &block.network,
+            &block.spent_outputs,
             transaction_updates,
             utxo_updates,
         )?;
@@ -131,6 +139,13 @@ fn append_block_updates(
                     coinbase: transaction.is_coinbase(),
                     transparent_inputs: transaction_inputs,
                     transparent_outputs: transaction_outputs,
+                    version: transaction.version(),
+                    lock_time: transaction.raw_lock_time(),
+                    lock_time_is_time: transaction.lock_time_is_time(),
+                    expiry_height: transaction.expiry_height().map(|height| height.0),
+                    network: block.network.to_string(),
+                    transparent_input_value_zat,
+                    transparent_output_value_zat,
                 }),
             ));
         }
@@ -158,14 +173,40 @@ struct EncodedTransparentUpdates {
     transaction_inputs: Vec<TransparentInput>,
     transaction_outputs: Vec<TransparentOutput>,
     utxo_changes: Vec<UtxoChange>,
+    transparent_input_value_zat: Option<u64>,
+    transparent_output_value_zat: u64,
+}
+
+struct TransparentEncodingContext<'a> {
+    network: &'a Network,
+    spent_outputs: &'a HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    transaction_updates: bool,
+    utxo_updates: bool,
+}
+
+#[derive(Clone, Default)]
+struct EncodedPreviousOutput {
+    value_zat: Option<u64>,
+    lock_script: Option<Bytes>,
+    address: Option<String>,
+    height: Option<u32>,
+    from_coinbase: Option<bool>,
 }
 
 fn encode_transparent_updates(
     transaction: &Transaction,
     transaction_id: transaction::Hash,
+    network: &Network,
+    spent_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     transaction_updates: bool,
     utxo_updates: bool,
 ) -> Result<EncodedTransparentUpdates, PluginError> {
+    let context = TransparentEncodingContext {
+        network,
+        spent_outputs,
+        transaction_updates,
+        utxo_updates,
+    };
     let mut transaction_inputs = if transaction_updates {
         Vec::with_capacity(transaction.inputs().len())
     } else {
@@ -186,121 +227,152 @@ fn encode_transparent_updates(
     } else {
         Vec::new()
     };
+    let mut transparent_input_value_zat = transaction_updates.then_some(0u64);
+    let mut transparent_output_value_zat = 0u64;
 
     for (input_index, input) in transaction.inputs().iter().enumerate() {
         let input_index = u32::try_from(input_index)
             .map_err(|_| PluginError::new("input index exceeds the gRPC protocol's u32 range"))?;
-        encode_transparent_input(
+        let input_value_zat = encode_transparent_input(
+            &context,
             input,
             input_index,
-            transaction_updates,
-            utxo_updates,
             &mut transaction_inputs,
             &mut utxo_changes,
         );
+        transparent_input_value_zat = match (transparent_input_value_zat, input_value_zat) {
+            (Some(total), Some(value)) => Some(total.checked_add(value).ok_or_else(|| {
+                PluginError::new("transparent input value exceeds the gRPC protocol's u64 range")
+            })?),
+            _ => None,
+        };
     }
 
     for (output_index, output) in transaction.outputs().iter().enumerate() {
         let output_index = u32::try_from(output_index)
             .map_err(|_| PluginError::new("output index exceeds the gRPC protocol's u32 range"))?;
-        encode_transparent_output(
+        let output_value_zat = encode_transparent_output(
+            &context,
             output,
             output_index,
             transaction_id,
-            transaction_updates,
-            utxo_updates,
             &mut transaction_outputs,
             &mut utxo_changes,
         );
+        transparent_output_value_zat = transparent_output_value_zat
+            .checked_add(output_value_zat)
+            .ok_or_else(|| {
+            PluginError::new("transparent output value exceeds the gRPC protocol's u64 range")
+        })?;
     }
 
     Ok(EncodedTransparentUpdates {
         transaction_inputs,
         transaction_outputs,
         utxo_changes,
+        transparent_input_value_zat,
+        transparent_output_value_zat,
     })
 }
 
 fn encode_transparent_input(
+    context: &TransparentEncodingContext<'_>,
     input: &transparent::Input,
     input_index: u32,
-    transaction_updates: bool,
-    utxo_updates: bool,
     transaction_inputs: &mut Vec<TransparentInput>,
     utxo_changes: &mut Vec<UtxoChange>,
-) {
+) -> Option<u64> {
     match input {
         transparent::Input::PrevOut {
             outpoint,
             unlock_script,
             sequence,
         } => {
-            let outpoint = Outpoint {
+            let previous = encode_previous_output(context, outpoint);
+            let grpc_outpoint = Outpoint {
                 transaction_id: outpoint.hash.to_string(),
                 output_index: outpoint.index,
             };
             let unlock_script = Bytes::copy_from_slice(unlock_script.as_raw_bytes());
 
-            if transaction_updates {
+            if context.transaction_updates {
                 transaction_inputs.push(TransparentInput {
                     input_index,
                     sequence: *sequence,
                     input: Some(transparent_input::Input::Prevout(TransparentPrevoutInput {
-                        previous_output: Some(outpoint.clone()),
+                        previous_output: Some(grpc_outpoint.clone()),
                         unlock_script: unlock_script.clone(),
+                        previous_value_zat: previous.value_zat,
+                        previous_lock_script: previous.lock_script.clone(),
+                        previous_address: previous.address.clone(),
+                        previous_height: previous.height,
+                        previous_from_coinbase: previous.from_coinbase,
                     })),
                 });
             }
-            if utxo_updates {
+            if context.utxo_updates {
                 utxo_changes.push(UtxoChange {
                     change: Some(utxo_change::Change::Spent(UtxoSpent {
-                        outpoint: Some(outpoint),
+                        outpoint: Some(grpc_outpoint),
                         input_index,
                         unlock_script,
                         sequence: *sequence,
+                        previous_value_zat: previous.value_zat,
+                        previous_lock_script: previous.lock_script,
+                        previous_address: previous.address,
+                        previous_height: previous.height,
+                        previous_from_coinbase: previous.from_coinbase,
                     })),
                 });
             }
+            previous.value_zat
         }
         transparent::Input::Coinbase {
             height,
             data,
             sequence,
-        } if transaction_updates => transaction_inputs.push(TransparentInput {
-            input_index,
-            sequence: *sequence,
-            input: Some(transparent_input::Input::Coinbase(
-                TransparentCoinbaseInput {
-                    height: height.0,
-                    data: Bytes::copy_from_slice(data),
-                },
-            )),
-        }),
-        transparent::Input::Coinbase { .. } => {}
+        } => {
+            if context.transaction_updates {
+                transaction_inputs.push(TransparentInput {
+                    input_index,
+                    sequence: *sequence,
+                    input: Some(transparent_input::Input::Coinbase(
+                        TransparentCoinbaseInput {
+                            height: height.0,
+                            data: Bytes::copy_from_slice(data),
+                        },
+                    )),
+                });
+            }
+            Some(0)
+        }
     }
 }
 
 fn encode_transparent_output(
+    context: &TransparentEncodingContext<'_>,
     output: &transparent::Output,
     output_index: u32,
     transaction_id: transaction::Hash,
-    transaction_updates: bool,
-    utxo_updates: bool,
     transaction_outputs: &mut Vec<TransparentOutput>,
     utxo_changes: &mut Vec<UtxoChange>,
-) {
+) -> u64 {
     let value_zat = u64::try_from(output.value.zatoshis())
         .expect("transparent output values are non-negative by type");
     let lock_script = Bytes::copy_from_slice(output.lock_script.as_raw_bytes());
+    let address = output
+        .address(context.network)
+        .map(|address| address.to_string());
 
-    if transaction_updates {
+    if context.transaction_updates {
         transaction_outputs.push(TransparentOutput {
             output_index,
             value_zat,
             lock_script: lock_script.clone(),
+            address: address.clone(),
         });
     }
-    if utxo_updates {
+    if context.utxo_updates {
         utxo_changes.push(UtxoChange {
             change: Some(utxo_change::Change::Created(UtxoCreated {
                 outpoint: Some(Outpoint {
@@ -309,8 +381,32 @@ fn encode_transparent_output(
                 }),
                 value_zat,
                 lock_script,
+                address,
             })),
         });
+    }
+    value_zat
+}
+
+fn encode_previous_output(
+    context: &TransparentEncodingContext<'_>,
+    outpoint: &transparent::OutPoint,
+) -> EncodedPreviousOutput {
+    let Some(previous) = context.spent_outputs.get(outpoint) else {
+        return EncodedPreviousOutput::default();
+    };
+    let output = &previous.utxo.output;
+    EncodedPreviousOutput {
+        value_zat: Some(
+            u64::try_from(output.value.zatoshis())
+                .expect("transparent output values are non-negative by type"),
+        ),
+        lock_script: Some(Bytes::copy_from_slice(output.lock_script.as_raw_bytes())),
+        address: output
+            .address(context.network)
+            .map(|address| address.to_string()),
+        height: Some(previous.utxo.height.0),
+        from_coinbase: Some(previous.utxo.from_coinbase),
     }
 }
 
@@ -404,17 +500,30 @@ mod tests {
         amount::{Amount, NonNegative},
         block::Height,
         transaction::LockTime,
-        transparent::{Input, OutPoint, Output, Script},
+        transparent::{Address, Input, OrderedUtxo, OutPoint, Output, Script},
     };
 
     use super::*;
 
     #[test]
     fn encodes_transaction_and_ordered_utxo_changes() {
+        let network = Network::Mainnet;
         let previous = OutPoint {
             hash: transaction::Hash([7; 32]),
             index: 3,
         };
+        let previous_address = Address::from_pub_key_hash(network.t_addr_kind(), [8; 20]);
+        let output_address = Address::from_pub_key_hash(network.t_addr_kind(), [9; 20]);
+        let previous_address_string = previous_address.to_string();
+        let output_address_string = output_address.to_string();
+        let spent_outputs = HashMap::from([(
+            previous,
+            OrderedUtxo::new(
+                Output::new(Amount::<NonNegative>::new(456), previous_address.script()),
+                Height(12),
+                0,
+            ),
+        )]);
         let transaction = Transaction::V1 {
             inputs: vec![Input::PrevOut {
                 outpoint: previous,
@@ -423,7 +532,7 @@ mod tests {
             }],
             outputs: vec![Output::new(
                 Amount::<NonNegative>::new(123),
-                Script::new(&[0x52]),
+                output_address.script(),
             )],
             lock_time: LockTime::unlocked(),
         };
@@ -439,10 +548,20 @@ mod tests {
             128
         );
 
-        let encoded = encode_transparent_updates(&transaction, transaction_id, true, true).unwrap();
+        let encoded = encode_transparent_updates(
+            &transaction,
+            transaction_id,
+            &network,
+            &spent_outputs,
+            true,
+            true,
+        )
+        .unwrap();
         assert_eq!(encoded.transaction_inputs.len(), 1);
         assert_eq!(encoded.transaction_outputs.len(), 1);
         assert_eq!(encoded.utxo_changes.len(), 2);
+        assert_eq!(encoded.transparent_input_value_zat, Some(456));
+        assert_eq!(encoded.transparent_output_value_zat, 123);
 
         let input = &encoded.transaction_inputs[0];
         assert_eq!(input.input_index, 0);
@@ -452,11 +571,21 @@ mod tests {
         };
         assert_eq!(prevout.unlock_script.as_ref(), [0x51]);
         assert_eq!(prevout.previous_output.as_ref().unwrap().output_index, 3);
+        assert_eq!(prevout.previous_value_zat, Some(456));
+        assert_eq!(
+            prevout.previous_address.as_deref(),
+            Some(previous_address_string.as_str())
+        );
+        assert_eq!(prevout.previous_height, Some(12));
+        assert_eq!(prevout.previous_from_coinbase, Some(true));
 
         let output = &encoded.transaction_outputs[0];
         assert_eq!(output.output_index, 0);
         assert_eq!(output.value_zat, 123);
-        assert_eq!(output.lock_script.as_ref(), [0x52]);
+        assert_eq!(
+            output.address.as_deref(),
+            Some(output_address_string.as_str())
+        );
 
         let Some(utxo_change::Change::Spent(spent)) = &encoded.utxo_changes[0].change else {
             panic!("the input must produce a spent UTXO change");
@@ -470,7 +599,10 @@ mod tests {
             panic!("the output must produce a created UTXO change");
         };
         assert_eq!(created.value_zat, 123);
-        assert_eq!(created.lock_script.as_ref(), [0x52]);
+        assert_eq!(
+            created.address.as_deref(),
+            Some(output_address_string.as_str())
+        );
         assert_eq!(created.outpoint.as_ref().unwrap().output_index, 0);
         assert_eq!(
             created.outpoint.as_ref().unwrap().transaction_id,
@@ -490,10 +622,19 @@ mod tests {
             lock_time: LockTime::unlocked(),
         };
 
-        let encoded =
-            encode_transparent_updates(&transaction, transaction.hash(), true, true).unwrap();
+        let encoded = encode_transparent_updates(
+            &transaction,
+            transaction.hash(),
+            &Network::Mainnet,
+            &HashMap::new(),
+            true,
+            true,
+        )
+        .unwrap();
         assert!(encoded.transaction_outputs.is_empty());
         assert!(encoded.utxo_changes.is_empty());
+        assert_eq!(encoded.transparent_input_value_zat, Some(0));
+        assert_eq!(encoded.transparent_output_value_zat, 0);
 
         let input = &encoded.transaction_inputs[0];
         assert_eq!(input.input_index, 0);

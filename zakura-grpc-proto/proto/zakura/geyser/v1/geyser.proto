@@ -40,6 +40,11 @@ message SubscribeRequestFilter {
   repeated EventType event_types = 1;
   // Ignore block-scoped events below this height.
   optional uint32 min_height = 2;
+  // Match transaction-scoped updates containing one of these transaction IDs.
+  repeated string transaction_ids = 3;
+  // Match transaction or UTXO updates involving one of these decoded
+  // transparent addresses.
+  repeated string transparent_addresses = 4;
 }
 
 message SubscribeUpdate {
@@ -129,6 +134,14 @@ message TransactionUpdate {
   repeated TransparentInput transparent_inputs = 10;
   // Decoded transparent outputs in consensus order.
   repeated TransparentOutput transparent_outputs = 11;
+  uint32 version = 12;
+  uint32 lock_time = 13;
+  bool lock_time_is_time = 14;
+  optional uint32 expiry_height = 15;
+  string network = 16;
+  // Present when verified context resolved every previous transparent output.
+  optional uint64 transparent_input_value_zat = 17;
+  uint64 transparent_output_value_zat = 18;
 }
 
 message TransparentInput {
@@ -145,6 +158,13 @@ message TransparentPrevoutInput {
   Outpoint previous_output = 1;
   // Raw scriptSig bytes without the CompactSize length prefix.
   bytes unlock_script = 2;
+  // The remaining fields are present when Zakura retained verified context for
+  // the previous output. Checkpoint-verified blocks can omit this context.
+  optional uint64 previous_value_zat = 3;
+  optional bytes previous_lock_script = 4;
+  optional string previous_address = 5;
+  optional uint32 previous_height = 6;
+  optional bool previous_from_coinbase = 7;
 }
 
 message TransparentCoinbaseInput {
@@ -157,6 +177,8 @@ message TransparentOutput {
   uint64 value_zat = 2;
   // Raw scriptPubKey bytes without the CompactSize length prefix.
   bytes lock_script = 3;
+  // Present for recognized P2PKH or P2SH scripts.
+  optional string address = 4;
 }
 
 message Outpoint {
@@ -169,6 +191,7 @@ message UtxoCreated {
   uint64 value_zat = 2;
   // Raw transparent scriptPubKey bytes without the CompactSize length prefix.
   bytes lock_script = 3;
+  optional string address = 4;
 }
 
 message UtxoSpent {
@@ -177,6 +200,11 @@ message UtxoSpent {
   // Raw scriptSig bytes without the CompactSize length prefix.
   bytes unlock_script = 3;
   uint32 sequence = 4;
+  optional uint64 previous_value_zat = 5;
+  optional bytes previous_lock_script = 6;
+  optional string previous_address = 7;
+  optional uint32 previous_height = 8;
+  optional bool previous_from_coinbase = 9;
 }
 
 message UtxoChange {

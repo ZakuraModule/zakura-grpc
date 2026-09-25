@@ -152,6 +152,10 @@ pub struct FilterLimits {
     pub max_event_types: usize,
     /// Maximum UTF-8 byte length of a filter name.
     pub max_name_bytes: usize,
+    /// Maximum transaction IDs in one named filter.
+    pub max_transaction_ids: usize,
+    /// Maximum transparent addresses in one named filter.
+    pub max_transparent_addresses: usize,
     /// Allow an empty filter to subscribe to every event type.
     pub allow_all: bool,
 }
@@ -167,6 +171,12 @@ impl FilterLimits {
         if self.max_name_bytes == 0 {
             return Err(ConfigError::ZeroMaxFilterNameBytes);
         }
+        if self.max_transaction_ids == 0 {
+            return Err(ConfigError::ZeroMaxTransactionIds);
+        }
+        if self.max_transparent_addresses == 0 {
+            return Err(ConfigError::ZeroMaxTransparentAddresses);
+        }
         Ok(())
     }
 }
@@ -177,6 +187,8 @@ impl Default for FilterLimits {
             max_named_filters: 32,
             max_event_types: 6,
             max_name_bytes: 128,
+            max_transaction_ids: 256,
+            max_transparent_addresses: 256,
             allow_all: true,
         }
     }
@@ -212,6 +224,12 @@ pub enum ConfigError {
     /// Filter names need a positive size limit.
     #[error("filter_limits.max_name_bytes must be greater than zero")]
     ZeroMaxFilterNameBytes,
+    /// At least one transaction ID must be representable in a filter.
+    #[error("filter_limits.max_transaction_ids must be greater than zero")]
+    ZeroMaxTransactionIds,
+    /// At least one transparent address must be representable in a filter.
+    #[error("filter_limits.max_transparent_addresses must be greater than zero")]
+    ZeroMaxTransparentAddresses,
 }
 
 #[cfg(test)]

@@ -1,6 +1,10 @@
+use std::collections::HashSet;
+
 use tonic::Status;
+use zakura_chain::{transaction, transparent::Address};
 use zakura_grpc_proto::geyser::{
-    EventType, SubscribeRequest, SubscribeRequestFilter, SubscribeUpdate,
+    best_chain_update, subscribe_update, transparent_input, utxo_change, EventType,
+    SubscribeRequest, SubscribeRequestFilter, SubscribeUpdate,
 };
 
 use crate::{config::FilterLimits, event::block_height};
@@ -30,13 +34,17 @@ impl EventFilter {
         }
 
         let legacy = (!request.event_types.is_empty())
-            .then(|| CompiledFilter::new(&request.event_types, None, limits))
+            .then(|| CompiledFilter::new(&request.event_types, None, &[], &[], limits))
             .transpose()?;
 
         let mut named = Vec::with_capacity(request.filters.len());
         for (name, filter) in &request.filters {
             validate_name(name, limits)?;
-            if filter.event_types.is_empty() && !limits.allow_all {
+            if filter.event_types.is_empty()
+                && filter.transaction_ids.is_empty()
+                && filter.transparent_addresses.is_empty()
+                && !limits.allow_all
+            {
                 return Err(Status::invalid_argument(format!(
                     "named filter {name:?} must select at least one event type"
                 )));
@@ -73,22 +81,44 @@ impl EventFilter {
 struct CompiledFilter {
     kinds: u64,
     min_height: Option<u32>,
+    transaction_ids: HashSet<String>,
+    transparent_addresses: HashSet<String>,
 }
 
 impl CompiledFilter {
     fn from_proto(filter: &SubscribeRequestFilter, limits: &FilterLimits) -> Result<Self, Status> {
-        Self::new(&filter.event_types, filter.min_height, limits)
+        Self::new(
+            &filter.event_types,
+            filter.min_height,
+            &filter.transaction_ids,
+            &filter.transparent_addresses,
+            limits,
+        )
     }
 
     fn new(
         event_types: &[i32],
         min_height: Option<u32>,
+        transaction_ids: &[String],
+        transparent_addresses: &[String],
         limits: &FilterLimits,
     ) -> Result<Self, Status> {
         if event_types.len() > limits.max_event_types {
             return Err(Status::invalid_argument(format!(
                 "at most {} event types are allowed per filter",
                 limits.max_event_types
+            )));
+        }
+        if transaction_ids.len() > limits.max_transaction_ids {
+            return Err(Status::invalid_argument(format!(
+                "at most {} transaction IDs are allowed per filter",
+                limits.max_transaction_ids
+            )));
+        }
+        if transparent_addresses.len() > limits.max_transparent_addresses {
+            return Err(Status::invalid_argument(format!(
+                "at most {} transparent addresses are allowed per filter",
+                limits.max_transparent_addresses
             )));
         }
 
@@ -105,7 +135,37 @@ impl CompiledFilter {
                 .expect("known protobuf event types fit in the u64 filter bitmask");
         }
 
-        Ok(Self { kinds, min_height })
+        let transaction_ids = transaction_ids
+            .iter()
+            .map(|transaction_id| {
+                transaction_id
+                    .parse::<transaction::Hash>()
+                    .map(|transaction_id| transaction_id.to_string())
+                    .map_err(|_| {
+                        Status::invalid_argument(format!(
+                            "invalid transaction ID {transaction_id:?}"
+                        ))
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let transparent_addresses = transparent_addresses
+            .iter()
+            .map(|address| {
+                address
+                    .parse::<Address>()
+                    .map(|address| canonical_transparent_address(address).to_string())
+                    .map_err(|_| {
+                        Status::invalid_argument(format!("invalid transparent address {address:?}"))
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+
+        Ok(Self {
+            kinds,
+            min_height,
+            transaction_ids,
+            transparent_addresses,
+        })
     }
 
     fn matches(&self, update: &SubscribeUpdate) -> bool {
@@ -115,7 +175,96 @@ impl CompiledFilter {
         let height_matches = self
             .min_height
             .is_none_or(|minimum| block_height(update).is_some_and(|height| height >= minimum));
-        kind_matches && height_matches
+        let transaction_matches = self.transaction_ids.is_empty()
+            || update_matches_transaction_id(update, &self.transaction_ids);
+        let address_matches = self.transparent_addresses.is_empty()
+            || update_matches_transparent_address(update, &self.transparent_addresses);
+        kind_matches && height_matches && transaction_matches && address_matches
+    }
+}
+
+fn canonical_transparent_address(address: Address) -> Address {
+    match address {
+        Address::Tex {
+            network_kind,
+            validating_key_hash,
+        } => Address::PayToPublicKeyHash {
+            network_kind,
+            pub_key_hash: validating_key_hash,
+        },
+        address => address,
+    }
+}
+
+fn update_matches_transaction_id(
+    update: &SubscribeUpdate,
+    transaction_ids: &HashSet<String>,
+) -> bool {
+    match update.update.as_ref() {
+        Some(subscribe_update::Update::Transaction(transaction)) => {
+            transaction_ids.contains(&transaction.transaction_id)
+        }
+        Some(subscribe_update::Update::Utxo(utxo)) => {
+            transaction_ids.contains(&utxo.transaction_id)
+        }
+        Some(subscribe_update::Update::Mempool(mempool)) => mempool
+            .transaction_ids
+            .iter()
+            .any(|transaction_id| transaction_ids.contains(transaction_id)),
+        Some(subscribe_update::Update::BestChain(best_chain)) => best_chain
+            .change
+            .as_ref()
+            .and_then(|change| match change {
+                best_chain_update::Change::Grow(grow) => Some(grow),
+                best_chain_update::Change::Reset(_) => None,
+            })
+            .is_some_and(|grow| {
+                grow.transaction_ids
+                    .iter()
+                    .any(|transaction_id| transaction_ids.contains(transaction_id))
+            }),
+        Some(subscribe_update::Update::Block(_) | subscribe_update::Update::Pong(_)) | None => {
+            false
+        }
+    }
+}
+
+fn update_matches_transparent_address(
+    update: &SubscribeUpdate,
+    transparent_addresses: &HashSet<String>,
+) -> bool {
+    match update.update.as_ref() {
+        Some(subscribe_update::Update::Transaction(transaction)) => transaction
+            .transparent_inputs
+            .iter()
+            .filter_map(|input| match input.input.as_ref() {
+                Some(transparent_input::Input::Prevout(previous)) => {
+                    previous.previous_address.as_ref()
+                }
+                Some(transparent_input::Input::Coinbase(_)) | None => None,
+            })
+            .chain(
+                transaction
+                    .transparent_outputs
+                    .iter()
+                    .filter_map(|output| output.address.as_ref()),
+            )
+            .any(|address| transparent_addresses.contains(address)),
+        Some(subscribe_update::Update::Utxo(utxo)) => utxo.changes.iter().any(|change| {
+            let address = match change.change.as_ref() {
+                Some(utxo_change::Change::Created(created)) => created.address.as_ref(),
+                Some(utxo_change::Change::Spent(spent)) => spent.previous_address.as_ref(),
+                None => None,
+            };
+            address.is_some_and(|address| transparent_addresses.contains(address))
+        }),
+        Some(
+            subscribe_update::Update::Block(_)
+            | subscribe_update::Update::BestChain(_)
+            | subscribe_update::Update::Mempool(_)
+            | subscribe_update::Update::Pong(_),
+        )
+        | None => false,
     }
 }
 
@@ -142,7 +291,10 @@ fn validate_name(name: &str, limits: &FilterLimits) -> Result<(), Status> {
 mod tests {
     use std::collections::HashMap;
 
-    use zakura_grpc_proto::geyser::{subscribe_update, BlockUpdate};
+    use zakura_chain::parameters::Network;
+    use zakura_grpc_proto::geyser::{
+        subscribe_update, BlockUpdate, TransactionUpdate, TransparentOutput,
+    };
 
     use super::*;
 
@@ -152,6 +304,21 @@ mod tests {
             update: Some(subscribe_update::Update::Block(BlockUpdate {
                 height,
                 ..BlockUpdate::default()
+            })),
+            ..SubscribeUpdate::default()
+        }
+    }
+
+    fn transaction_update(transaction_id: String, address: String) -> SubscribeUpdate {
+        SubscribeUpdate {
+            event_type: EventType::Transaction.into(),
+            update: Some(subscribe_update::Update::Transaction(TransactionUpdate {
+                transaction_id,
+                transparent_outputs: vec![TransparentOutput {
+                    address: Some(address),
+                    ..TransparentOutput::default()
+                }],
+                ..TransactionUpdate::default()
             })),
             ..SubscribeUpdate::default()
         }
@@ -175,6 +342,7 @@ mod tests {
                 SubscribeRequestFilter {
                     event_types: vec![EventType::BlockFinalized.into()],
                     min_height: Some(10),
+                    ..SubscribeRequestFilter::default()
                 },
             ),
             (
@@ -182,6 +350,7 @@ mod tests {
                 SubscribeRequestFilter {
                     event_types: vec![EventType::BlockFinalized.into()],
                     min_height: None,
+                    ..SubscribeRequestFilter::default()
                 },
             ),
         ]);
@@ -220,6 +389,30 @@ mod tests {
         assert_eq!(
             EventFilter::new(&request, &limits).unwrap_err().code(),
             tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn named_filter_matches_transaction_id_and_address() {
+        let transaction_id = transaction::Hash([7; 32]).to_string();
+        let address = Address::from_pub_key_hash(Network::Mainnet.t_addr_kind(), [9; 20]);
+        let request = SubscribeRequest {
+            filters: HashMap::from([(
+                "wallet".to_owned(),
+                SubscribeRequestFilter {
+                    event_types: vec![EventType::Transaction.into()],
+                    transaction_ids: vec![transaction_id.clone()],
+                    transparent_addresses: vec![address.to_string()],
+                    ..SubscribeRequestFilter::default()
+                },
+            )]),
+            ..SubscribeRequest::default()
+        };
+        let filter = EventFilter::new(&request, &FilterLimits::default()).unwrap();
+
+        assert_eq!(
+            filter.matched_names(&transaction_update(transaction_id, address.to_string())),
+            Some(vec!["wallet".to_owned()])
         );
     }
 }

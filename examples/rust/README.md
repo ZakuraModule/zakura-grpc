@@ -9,6 +9,9 @@ cargo run -p zakura-grpc-client-example -- subscribe \
 cargo run -p zakura-grpc-client-example -- subscribe \
   --event transaction --filter-name transactions --reconnect
 cargo run -p zakura-grpc-client-example -- subscribe \
+  --event transaction --filter-name wallet \
+  --address tmWbBGi7TjExNmLZyMcFpxVh3ZPbGrpbX3H --reconnect
+cargo run -p zakura-grpc-client-example -- subscribe \
   --event utxo --filter-name utxos --reconnect
 ```
 
