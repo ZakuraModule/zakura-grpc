@@ -19,6 +19,12 @@ pub struct Config {
     pub utxo_updates: bool,
     /// Number of distinct block heights retained for short reconnect replay.
     pub replay_stored_blocks: usize,
+    /// Maximum number of protobuf updates retained in the replay window.
+    pub replay_max_events: usize,
+    /// Maximum encoded protobuf bytes retained in the replay window.
+    pub replay_max_bytes: usize,
+    /// Maximum replay entry age in seconds, or no age limit when omitted.
+    pub replay_max_age_seconds: Option<u64>,
     /// Capacity of the live event broadcast ring.
     pub broadcast_capacity: usize,
     /// Bounded outbound queue capacity for each connected client.
@@ -37,6 +43,10 @@ pub struct Config {
     pub subscription_limit_enforce: bool,
     /// Limits applied whenever a client installs a subscription filter.
     pub filter_limits: FilterLimits,
+    /// Number of dedicated threads used to encode transactions inside one block event.
+    pub event_encoding_threads: usize,
+    /// Minimum transaction count required before parallel event encoding is used.
+    pub parallel_encoding_min_transactions: usize,
     /// Enable Tonic's adaptive HTTP/2 flow-control window.
     pub server_http2_adaptive_window: Option<bool>,
     /// HTTP/2 keepalive interval in milliseconds.
@@ -54,6 +64,15 @@ impl Config {
         if self.broadcast_capacity == 0 {
             return Err(ConfigError::ZeroBroadcastCapacity);
         }
+        if self.replay_max_events == 0 {
+            return Err(ConfigError::ZeroReplayMaxEvents);
+        }
+        if self.replay_max_bytes == 0 {
+            return Err(ConfigError::ZeroReplayMaxBytes);
+        }
+        if self.replay_max_age_seconds == Some(0) {
+            return Err(ConfigError::ZeroReplayMaxAge);
+        }
         if self.client_channel_capacity == 0 {
             return Err(ConfigError::ZeroClientChannelCapacity);
         }
@@ -62,6 +81,12 @@ impl Config {
         }
         if self.max_encoding_message_size == 0 {
             return Err(ConfigError::ZeroMaxEncodingMessageSize);
+        }
+        if self.event_encoding_threads == 0 {
+            return Err(ConfigError::ZeroEventEncodingThreads);
+        }
+        if self.parallel_encoding_min_transactions == 0 {
+            return Err(ConfigError::ZeroParallelEncodingMinTransactions);
         }
         if self.x_token.as_ref().is_some_and(String::is_empty) {
             return Err(ConfigError::EmptyToken);
@@ -85,6 +110,9 @@ impl Default for Config {
             transaction_updates: true,
             utxo_updates: true,
             replay_stored_blocks: 150,
+            replay_max_events: 250_000,
+            replay_max_bytes: 512 * 1024 * 1024,
+            replay_max_age_seconds: Some(4 * 60 * 60),
             broadcast_capacity: 100_000,
             client_channel_capacity: 10_000,
             max_decoding_message_size: 4 * 1024 * 1024,
@@ -95,6 +123,8 @@ impl Default for Config {
                 .expect("the default subscription limit is non-zero"),
             subscription_limit_enforce: false,
             filter_limits: FilterLimits::default(),
+            event_encoding_threads: 1,
+            parallel_encoding_min_transactions: 32,
             server_http2_adaptive_window: Some(true),
             server_http2_keepalive_interval_ms: None,
             server_http2_keepalive_timeout_ms: None,
@@ -197,6 +227,15 @@ impl Default for FilterLimits {
 /// Invalid plugin configuration.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ConfigError {
+    /// Replay must have an event limit even when height retention is disabled.
+    #[error("replay_max_events must be greater than zero")]
+    ZeroReplayMaxEvents,
+    /// Replay must have a byte limit even when height retention is disabled.
+    #[error("replay_max_bytes must be greater than zero")]
+    ZeroReplayMaxBytes,
+    /// An enabled age limit must retain entries for a positive duration.
+    #[error("replay_max_age_seconds must be omitted or greater than zero")]
+    ZeroReplayMaxAge,
     /// The live broadcast ring cannot be empty.
     #[error("broadcast_capacity must be greater than zero")]
     ZeroBroadcastCapacity,
@@ -209,6 +248,12 @@ pub enum ConfigError {
     /// Tonic must be able to encode at least one byte per response.
     #[error("max_encoding_message_size must be greater than zero")]
     ZeroMaxEncodingMessageSize,
+    /// Event encoding needs at least one worker thread.
+    #[error("event_encoding_threads must be greater than zero")]
+    ZeroEventEncodingThreads,
+    /// Parallel encoding needs a positive activation threshold.
+    #[error("parallel_encoding_min_transactions must be greater than zero")]
+    ZeroParallelEncodingMinTransactions,
     /// Empty tokens can be confused with disabled authentication.
     #[error("x_token must be omitted or contain at least one character")]
     EmptyToken,
@@ -241,6 +286,9 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.listen_addr, "127.0.0.1:10000".parse().unwrap());
         assert_eq!(config.replay_stored_blocks, 150);
+        assert_eq!(config.replay_max_events, 250_000);
+        assert_eq!(config.replay_max_bytes, 512 * 1024 * 1024);
+        assert_eq!(config.replay_max_age_seconds, Some(4 * 60 * 60));
         assert!(config.validate().is_ok());
     }
 
@@ -260,5 +308,47 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(config.validate(), Err(ConfigError::EmptyToken));
+    }
+
+    #[test]
+    fn zero_replay_resource_limits_are_rejected() {
+        let no_events = Config {
+            replay_max_events: 0,
+            ..Config::default()
+        };
+        assert_eq!(no_events.validate(), Err(ConfigError::ZeroReplayMaxEvents));
+
+        let no_bytes = Config {
+            replay_max_bytes: 0,
+            ..Config::default()
+        };
+        assert_eq!(no_bytes.validate(), Err(ConfigError::ZeroReplayMaxBytes));
+
+        let zero_age = Config {
+            replay_max_age_seconds: Some(0),
+            ..Config::default()
+        };
+        assert_eq!(zero_age.validate(), Err(ConfigError::ZeroReplayMaxAge));
+    }
+
+    #[test]
+    fn zero_encoding_limits_are_rejected() {
+        let no_threads = Config {
+            event_encoding_threads: 0,
+            ..Config::default()
+        };
+        assert_eq!(
+            no_threads.validate(),
+            Err(ConfigError::ZeroEventEncodingThreads)
+        );
+
+        let no_threshold = Config {
+            parallel_encoding_min_transactions: 0,
+            ..Config::default()
+        };
+        assert_eq!(
+            no_threshold.validate(),
+            Err(ConfigError::ZeroParallelEncodingMinTransactions)
+        );
     }
 }

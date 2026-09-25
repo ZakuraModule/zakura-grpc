@@ -68,6 +68,9 @@ listen_addr = "127.0.0.1:10000"
 transaction_updates = true
 utxo_updates = true
 replay_stored_blocks = 150
+replay_max_events = 250000
+replay_max_bytes = 536870912
+replay_max_age_seconds = 14400
 broadcast_capacity = 100000
 client_channel_capacity = 10000
 max_decoding_message_size = 4194304
@@ -77,6 +80,8 @@ compression = { accept = ["gzip", "zstd"], send = ["gzip", "zstd"] }
 subscription_limit = 1000
 subscription_limit_enforce = false
 filter_limits = { max_named_filters = 32, max_event_types = 6, max_name_bytes = 128, max_transaction_ids = 256, max_transparent_addresses = 256, allow_all = true }
+event_encoding_threads = 1
+parallel_encoding_min_transactions = 32
 server_http2_adaptive_window = true
 # server_http2_keepalive_interval_ms = 30000
 # server_http2_keepalive_timeout_ms = 10000
@@ -88,6 +93,12 @@ table:
 ```sh
 cargo run -p zakura-grpc-geyser --bin config-check -- ./grpc-plugin.toml
 ```
+
+Replay is retained in source-event buckets and is bounded simultaneously by
+distinct height count, protobuf update count, encoded protobuf bytes, and age.
+Setting `replay_stored_blocks = 0` disables replay. Set
+`event_encoding_threads` above one to enable ordered parallel transaction
+encoding for blocks containing at least `parallel_encoding_min_transactions`.
 
 ## Example client
 
@@ -179,6 +190,32 @@ while let Some(update) = updates.message().await? {
 # }
 ```
 
+## Performance measurement
+
+Run the release-mode load test against a live node without printing individual
+updates:
+
+```sh
+cargo run --release -p zakura-grpc-client-example --bin load-test -- \
+  --endpoint http://127.0.0.1:10000 \
+  --clients 10 \
+  --duration-seconds 60 \
+  --event transaction \
+  --event utxo
+```
+
+The result reports aggregate messages/second, encoded MiB/second, event counts,
+and p50/p95/p99 event-to-client latency. Add `--gzip` to measure compression or
+`--from-height` to exercise replay. Latency is measured from the event's
+`observed_at` timestamp, so replayed events intentionally include their time in
+the replay window.
+
+The plugin exports bounded-cardinality metrics for encode, publish, handler,
+filter, replay snapshot, replay lock, and outbound queue wait durations. Replay
+gauges report retained buckets, heights, events, and bytes; eviction counters
+are labeled by `height`, `events`, `bytes`, or `age`. Message byte counters are
+split by event and live/replay delivery.
+
 `from_height` is accepted on the initial subscription request. If the requested
 height has been evicted, the server returns `OUT_OF_RANGE`; clients can query
 `SubscribeReplayInfo` to discover the first retained height.
@@ -187,6 +224,7 @@ height has been evicted, the server returns `OUT_OF_RANGE`; clients can query
 
 - The Zakura plugin manager isolates node callbacks from gRPC work.
 - The live broadcast ring and every client queue are bounded.
+- The replay window has independent height, event, byte, and age limits.
 - Lagging clients are disconnected and can reconnect using `from_height`.
 - Replay data disappears when the node restarts.
 - The reconnecting Rust client resumes from a height checkpoint and suppresses
@@ -202,7 +240,9 @@ height has been evicted, the server returns `OUT_OF_RANGE`; clients can query
   carry the same optional verified previous-output context.
 - Binary protobuf fields use reference-counted buffers, so cloning an update for
   replay and multiple subscribers does not copy block, transaction, or script
-  bytes. Transaction and UTXO views are produced in the same transaction pass.
+  bytes. Protobuf size is calculated once per update, replay stores event
+  buckets, and transaction/UTXO views are produced in the same transaction
+  pass. Slow subscribers reserve outbound capacity before cloning their view.
 
 ## Yellowstone scope mapping
 

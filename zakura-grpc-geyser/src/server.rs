@@ -1,11 +1,13 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     pin::Pin,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use futures_core::Stream;
 use parking_lot::Mutex;
+use prost::Message;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -26,10 +28,25 @@ use crate::{
 
 type SubscribeResult = Result<SubscribeUpdate, Status>;
 
+#[derive(Debug)]
+struct PublishedUpdate {
+    message: SubscribeUpdate,
+    encoded_len: usize,
+}
+
+impl PublishedUpdate {
+    fn new(message: SubscribeUpdate) -> Self {
+        let encoded_len = message.encoded_len();
+        Self {
+            message,
+            encoded_len,
+        }
+    }
+}
+
 pub(crate) struct SharedState {
-    live: broadcast::Sender<Arc<SubscribeUpdate>>,
+    live: broadcast::Sender<Arc<PublishedUpdate>>,
     replay: Mutex<ReplayBuffer>,
-    replay_capacity: usize,
     client_channel_capacity: usize,
 }
 
@@ -38,18 +55,37 @@ impl SharedState {
         let (live, _) = broadcast::channel(config.broadcast_capacity);
         Self {
             live,
-            replay: Mutex::new(ReplayBuffer::new(config.replay_stored_blocks)),
-            replay_capacity: config.replay_stored_blocks,
+            replay: Mutex::new(ReplayBuffer::new(ReplayLimits {
+                height_capacity: config.replay_stored_blocks,
+                event_capacity: config.replay_max_events,
+                byte_capacity: config.replay_max_bytes,
+                max_age: config.replay_max_age_seconds.map(Duration::from_secs),
+            })),
             client_channel_capacity: config.client_channel_capacity,
         }
     }
 
-    pub(crate) fn publish(&self, update: SubscribeUpdate) {
-        let update = Arc::new(update);
-        if block_height(&update).is_some() {
-            self.replay.lock().push(Arc::clone(&update));
+    pub(crate) fn publish_batch(&self, updates: Vec<SubscribeUpdate>) {
+        let updates: Vec<_> = updates
+            .into_iter()
+            .map(PublishedUpdate::new)
+            .map(Arc::new)
+            .collect();
+
+        let replay_lock_started = Instant::now();
+        self.replay.lock().push_batch(&updates);
+        metrics::histogram!("plugin.grpc.replay.lock.duration")
+            .record(replay_lock_started.elapsed().as_secs_f64());
+
+        for update in updates {
+            metrics::counter!(
+                "plugin.grpc.messages.published.bytes.total",
+                "event" => event_type_label(update.message.event_type),
+            )
+            .increment(u64::try_from(update.encoded_len).unwrap_or(u64::MAX));
+            let _ = self.live.send(update);
         }
-        let subscriber_count = self.live.send(update).unwrap_or(0);
+        let subscriber_count = self.live.receiver_count();
         let subscriber_count = u32::try_from(subscriber_count).unwrap_or(u32::MAX);
         metrics::gauge!("plugin.grpc.subscribers").set(f64::from(subscriber_count));
     }
@@ -57,66 +93,159 @@ impl SharedState {
     fn subscribe(
         &self,
         from_height: Option<u32>,
-    ) -> Result<(broadcast::Receiver<Arc<SubscribeUpdate>>, ReplaySnapshot), Status> {
+    ) -> Result<(broadcast::Receiver<Arc<PublishedUpdate>>, ReplaySnapshot), Status> {
         // Subscribe first so events racing with the snapshot remain in the live ring.
         // The sequence watermark removes the overlap without creating a gap.
         let receiver = self.live.subscribe();
+        let replay_started = Instant::now();
         let snapshot = self.replay.lock().snapshot(from_height)?;
+        metrics::histogram!("plugin.grpc.replay.snapshot.duration")
+            .record(replay_started.elapsed().as_secs_f64());
+        metrics::histogram!("plugin.grpc.replay.snapshot.events")
+            .record(usize_metric_value(snapshot.updates.len()));
         Ok((receiver, snapshot))
     }
 
     fn replay_info(&self) -> SubscribeReplayInfoResponse {
-        let replay = self.replay.lock();
+        let mut replay = self.replay.lock();
+        replay.evict(Instant::now());
         SubscribeReplayInfoResponse {
             first_available_height: replay.first_available_height(),
             latest_height: replay.latest_height(),
-            retained_block_capacity: u32::try_from(self.replay_capacity).unwrap_or(u32::MAX),
+            retained_block_capacity: u32::try_from(replay.limits.height_capacity)
+                .unwrap_or(u32::MAX),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReplayLimits {
+    height_capacity: usize,
+    event_capacity: usize,
+    byte_capacity: usize,
+    max_age: Option<Duration>,
+}
+
+#[derive(Debug)]
+struct ReplayBucket {
+    height: u32,
+    inserted_at: Instant,
+    updates: Vec<Arc<PublishedUpdate>>,
+    encoded_bytes: usize,
 }
 
 struct ReplayBuffer {
-    capacity: usize,
-    heights: VecDeque<u32>,
-    height_set: HashSet<u32>,
-    updates: VecDeque<Arc<SubscribeUpdate>>,
+    limits: ReplayLimits,
+    buckets: VecDeque<ReplayBucket>,
+    height_counts: HashMap<u32, usize>,
+    event_count: usize,
+    encoded_bytes: usize,
 }
 
 impl ReplayBuffer {
-    fn new(capacity: usize) -> Self {
+    fn new(limits: ReplayLimits) -> Self {
         Self {
-            capacity,
-            heights: VecDeque::new(),
-            height_set: HashSet::new(),
-            updates: VecDeque::new(),
+            limits,
+            buckets: VecDeque::new(),
+            height_counts: HashMap::new(),
+            event_count: 0,
+            encoded_bytes: 0,
         }
     }
 
-    fn push(&mut self, update: Arc<SubscribeUpdate>) {
-        if self.capacity == 0 {
+    fn push_batch(&mut self, updates: &[Arc<PublishedUpdate>]) {
+        self.push_batch_at(updates, Instant::now());
+    }
+
+    fn push_batch_at(&mut self, updates: &[Arc<PublishedUpdate>], now: Instant) {
+        if self.limits.height_capacity == 0 {
+            self.update_metrics();
             return;
         }
-        let Some(height) = block_height(&update) else {
+        let Some(height) = updates
+            .iter()
+            .find_map(|update| block_height(&update.message))
+        else {
+            self.evict(now);
             return;
         };
+        let replay_updates: Vec<_> = updates
+            .iter()
+            .filter(|update| block_height(&update.message) == Some(height))
+            .cloned()
+            .collect();
+        debug_assert_eq!(
+            replay_updates.len(),
+            updates
+                .iter()
+                .filter(|update| block_height(&update.message).is_some())
+                .count(),
+            "one source event must not contain updates from multiple block heights"
+        );
+        let encoded_bytes = replay_updates
+            .iter()
+            .map(|update| update.encoded_len)
+            .sum::<usize>();
 
-        if self.height_set.insert(height) {
-            self.heights.push_back(height);
-        }
-        self.updates.push_back(update);
-
-        while self.heights.len() > self.capacity {
-            let evicted_height = self
-                .heights
-                .pop_front()
-                .expect("a height exists because the buffer exceeds its capacity");
-            self.height_set.remove(&evicted_height);
-            self.updates
-                .retain(|stored| block_height(stored) != Some(evicted_height));
-        }
+        *self.height_counts.entry(height).or_default() += 1;
+        self.event_count = self.event_count.saturating_add(replay_updates.len());
+        self.encoded_bytes = self.encoded_bytes.saturating_add(encoded_bytes);
+        self.buckets.push_back(ReplayBucket {
+            height,
+            inserted_at: now,
+            updates: replay_updates,
+            encoded_bytes,
+        });
+        self.evict(now);
     }
 
-    fn snapshot(&self, from_height: Option<u32>) -> Result<ReplaySnapshot, Status> {
+    fn evict(&mut self, now: Instant) {
+        loop {
+            let reason = if self.buckets.front().is_some_and(|bucket| {
+                self.limits.max_age.is_some_and(|max_age| {
+                    now.saturating_duration_since(bucket.inserted_at) > max_age
+                })
+            }) {
+                Some("age")
+            } else if self.height_counts.len() > self.limits.height_capacity {
+                Some("height")
+            } else if self.event_count > self.limits.event_capacity {
+                Some("events")
+            } else if self.encoded_bytes > self.limits.byte_capacity {
+                Some("bytes")
+            } else {
+                None
+            };
+            let Some(reason) = reason else {
+                break;
+            };
+            self.evict_front(reason);
+        }
+        self.update_metrics();
+    }
+
+    fn evict_front(&mut self, reason: &'static str) {
+        let Some(bucket) = self.buckets.pop_front() else {
+            return;
+        };
+        self.event_count = self.event_count.saturating_sub(bucket.updates.len());
+        self.encoded_bytes = self.encoded_bytes.saturating_sub(bucket.encoded_bytes);
+        if let Some(count) = self.height_counts.get_mut(&bucket.height) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.height_counts.remove(&bucket.height);
+            }
+        }
+        metrics::counter!("plugin.grpc.replay.evicted.buckets.total", "reason" => reason)
+            .increment(1);
+        metrics::counter!("plugin.grpc.replay.evicted.events.total", "reason" => reason)
+            .increment(u64::try_from(bucket.updates.len()).unwrap_or(u64::MAX));
+        metrics::counter!("plugin.grpc.replay.evicted.bytes.total", "reason" => reason)
+            .increment(u64::try_from(bucket.encoded_bytes).unwrap_or(u64::MAX));
+    }
+
+    fn snapshot(&mut self, from_height: Option<u32>) -> Result<ReplaySnapshot, Status> {
+        self.evict(Instant::now());
         if let (Some(requested), Some(first_available)) =
             (from_height, self.first_available_height())
         {
@@ -127,12 +256,16 @@ impl ReplayBuffer {
             }
         }
 
-        let watermark = self.updates.back().map_or(0, |update| update.sequence);
+        let watermark = self
+            .buckets
+            .back()
+            .and_then(|bucket| bucket.updates.last())
+            .map_or(0, |update| update.message.sequence);
         let updates = from_height.map_or_else(Vec::new, |requested| {
-            self.updates
+            self.buckets
                 .iter()
-                .filter(|update| block_height(update).is_some_and(|height| height >= requested))
-                .cloned()
+                .filter(|bucket| bucket.height >= requested)
+                .flat_map(|bucket| bucket.updates.iter().cloned())
                 .collect()
         });
 
@@ -140,18 +273,36 @@ impl ReplayBuffer {
     }
 
     fn first_available_height(&self) -> Option<u32> {
-        self.heights.front().copied()
+        self.height_counts.keys().copied().min()
     }
 
     fn latest_height(&self) -> Option<u32> {
-        self.heights.back().copied()
+        self.height_counts.keys().copied().max()
+    }
+
+    fn update_metrics(&self) {
+        metrics::gauge!("plugin.grpc.replay.buckets").set(usize_metric_value(self.buckets.len()));
+        metrics::gauge!("plugin.grpc.replay.heights")
+            .set(usize_metric_value(self.height_counts.len()));
+        metrics::gauge!("plugin.grpc.replay.events").set(usize_metric_value(self.event_count));
+        metrics::gauge!("plugin.grpc.replay.bytes").set(usize_metric_value(self.encoded_bytes));
     }
 }
 
 #[derive(Debug)]
 struct ReplaySnapshot {
-    updates: Vec<Arc<SubscribeUpdate>>,
+    updates: Vec<Arc<PublishedUpdate>>,
     watermark: u64,
+}
+
+fn usize_metric_value(value: usize) -> f64 {
+    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+fn event_type_label(event_type: i32) -> &'static str {
+    EventType::try_from(event_type)
+        .unwrap_or(EventType::Unspecified)
+        .as_str_name()
 }
 
 #[derive(Clone)]
@@ -213,7 +364,7 @@ impl Geyser for GrpcService {
         tokio::spawn(async move {
             let _subscription_guard = subscription_guard;
             for update in replay.updates {
-                if !send_filtered(&outbound_tx, &filter, &update).await {
+                if !send_filtered(&outbound_tx, &filter, &update, "replay").await {
                     return;
                 }
             }
@@ -256,21 +407,21 @@ impl Geyser for GrpcService {
                     update = live.recv() => {
                         match update {
                             Ok(update) => {
-                                if update.sequence <= replay_watermark {
+                                if update.message.sequence <= replay_watermark {
                                     continue;
                                 }
-                                replay_watermark = update.sequence;
-                                if !send_filtered(&outbound_tx, &filter, &update).await {
+                                replay_watermark = update.message.sequence;
+                                if !send_filtered(&outbound_tx, &filter, &update, "live").await {
                                     break;
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 metrics::counter!("plugin.grpc.client_lagged.total").increment(1);
-                                let _ = outbound_tx
-                                    .send(Err(Status::resource_exhausted(format!(
+                                metrics::counter!("plugin.grpc.client_lagged.events.total")
+                                    .increment(skipped);
+                                let _ = outbound_tx.try_send(Err(Status::resource_exhausted(format!(
                                         "subscriber lagged by {skipped} events; reconnect with from_height"
-                                    ))))
-                                    .await;
+                                    ))));
                                 break;
                             }
                             Err(broadcast::error::RecvError::Closed) => break,
@@ -315,22 +466,52 @@ impl Geyser for GrpcService {
 async fn send_filtered(
     outbound: &mpsc::Sender<SubscribeResult>,
     filter: &EventFilter,
-    update: &SubscribeUpdate,
+    update: &PublishedUpdate,
+    delivery: &'static str,
 ) -> bool {
-    let Some(names) = filter.matched_names(update) else {
+    let filter_started = Instant::now();
+    let matched_names = filter.matched_names(&update.message);
+    metrics::histogram!(
+        "plugin.grpc.filter.duration",
+        "event" => event_type_label(update.message.event_type),
+    )
+    .record(filter_started.elapsed().as_secs_f64());
+    let Some(names) = matched_names else {
         return true;
     };
-    let mut update = update.clone();
-    update.filters = names;
-    let event_type = update.event_type.to_string();
-    if outbound.send(Ok(update)).await.is_err() {
+
+    let available = outbound.capacity();
+    let maximum = outbound.max_capacity();
+    let used = maximum.saturating_sub(available);
+    let utilization = if maximum == 0 {
+        1.0
+    } else {
+        usize_metric_value(used) / usize_metric_value(maximum)
+    };
+    metrics::histogram!("plugin.grpc.outbound.queue.utilization").record(utilization);
+
+    let wait_started = Instant::now();
+    let Ok(permit) = outbound.reserve().await else {
         return false;
-    }
+    };
+    metrics::histogram!("plugin.grpc.outbound.queue.wait.duration")
+        .record(wait_started.elapsed().as_secs_f64());
+
+    let mut message = update.message.clone();
+    message.filters = names;
+    permit.send(Ok(message));
     metrics::counter!(
         "plugin.grpc.messages_sent.total",
-        "event" => event_type
+        "event" => event_type_label(update.message.event_type),
+        "delivery" => delivery,
     )
     .increment(1);
+    metrics::counter!(
+        "plugin.grpc.messages_sent.bytes.total",
+        "event" => event_type_label(update.message.event_type),
+        "delivery" => delivery,
+    )
+    .increment(u64::try_from(update.encoded_len).unwrap_or(u64::MAX));
     true
 }
 
@@ -343,6 +524,15 @@ pub(crate) async fn mark_serving(reporter: &mut tonic_health::server::HealthRepo
 mod tests {
     use super::*;
     use zakura_grpc_proto::geyser::BlockUpdate;
+
+    fn replay_limits(max_heights: usize) -> ReplayLimits {
+        ReplayLimits {
+            height_capacity: max_heights,
+            event_capacity: 100,
+            byte_capacity: 1024 * 1024,
+            max_age: None,
+        }
+    }
 
     fn block_update(height: u32, sequence: u64) -> SubscribeUpdate {
         SubscribeUpdate {
@@ -357,13 +547,16 @@ mod tests {
         }
     }
 
+    fn published_block(height: u32, sequence: u64) -> Arc<PublishedUpdate> {
+        Arc::new(PublishedUpdate::new(block_update(height, sequence)))
+    }
+
     #[test]
     fn replay_retains_distinct_block_heights() {
-        let mut replay = ReplayBuffer::new(2);
-        replay.push(Arc::new(block_update(10, 1)));
-        replay.push(Arc::new(block_update(10, 2)));
-        replay.push(Arc::new(block_update(11, 3)));
-        replay.push(Arc::new(block_update(12, 4)));
+        let mut replay = ReplayBuffer::new(replay_limits(2));
+        replay.push_batch(&[published_block(10, 1), published_block(10, 2)]);
+        replay.push_batch(&[published_block(11, 3)]);
+        replay.push_batch(&[published_block(12, 4)]);
 
         assert_eq!(replay.first_available_height(), Some(11));
         let snapshot = replay.snapshot(Some(11)).unwrap();
@@ -373,11 +566,64 @@ mod tests {
 
     #[test]
     fn replay_rejects_evicted_height() {
-        let mut replay = ReplayBuffer::new(1);
-        replay.push(Arc::new(block_update(20, 1)));
-        replay.push(Arc::new(block_update(21, 2)));
+        let mut replay = ReplayBuffer::new(replay_limits(1));
+        replay.push_batch(&[published_block(20, 1)]);
+        replay.push_batch(&[published_block(21, 2)]);
 
         let status = replay.snapshot(Some(20)).unwrap_err();
         assert_eq!(status.code(), tonic::Code::OutOfRange);
+    }
+
+    #[test]
+    fn replay_evicts_whole_buckets_by_event_limit() {
+        let mut limits = replay_limits(10);
+        limits.event_capacity = 2;
+        let mut replay = ReplayBuffer::new(limits);
+        replay.push_batch(&[published_block(10, 1), published_block(10, 2)]);
+        replay.push_batch(&[published_block(11, 3)]);
+
+        let snapshot = replay.snapshot(Some(11)).unwrap();
+        assert_eq!(snapshot.updates.len(), 1);
+        assert_eq!(snapshot.updates[0].message.sequence, 3);
+        assert_eq!(replay.event_count, 1);
+    }
+
+    #[test]
+    fn replay_evicts_whole_buckets_by_byte_limit() {
+        let first = published_block(10, 1);
+        let second = published_block(11, 2);
+        let mut limits = replay_limits(10);
+        limits.byte_capacity = first.encoded_len.max(second.encoded_len);
+        let mut replay = ReplayBuffer::new(limits);
+        replay.push_batch(&[first]);
+        replay.push_batch(&[second]);
+
+        assert_eq!(replay.first_available_height(), Some(11));
+        assert_eq!(replay.event_count, 1);
+    }
+
+    #[test]
+    fn replay_evicts_expired_buckets() {
+        let mut limits = replay_limits(10);
+        limits.max_age = Some(Duration::from_secs(10));
+        let mut replay = ReplayBuffer::new(limits);
+        let inserted_at = Instant::now();
+        replay.push_batch_at(&[published_block(10, 1)], inserted_at);
+
+        replay.evict(inserted_at + Duration::from_secs(11));
+
+        assert!(replay.buckets.is_empty());
+        assert_eq!(replay.event_count, 0);
+        assert_eq!(replay.encoded_bytes, 0);
+    }
+
+    #[test]
+    fn replay_range_uses_height_values_not_arrival_order() {
+        let mut replay = ReplayBuffer::new(replay_limits(10));
+        replay.push_batch(&[published_block(200, 1)]);
+        replay.push_batch(&[published_block(100, 2)]);
+
+        assert_eq!(replay.first_available_height(), Some(100));
+        assert_eq!(replay.latest_height(), Some(200));
     }
 }

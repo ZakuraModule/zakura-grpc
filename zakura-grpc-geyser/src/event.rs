@@ -1,10 +1,12 @@
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
 use prost_types::Timestamp;
+use rayon::{prelude::*, ThreadPool};
 use zakura_chain::{
     parameters::Network,
     serialization::ZcashSerialize,
@@ -26,20 +28,23 @@ pub(crate) fn encode_event(
     event: &EventEnvelope,
     transaction_updates: bool,
     utxo_updates: bool,
+    encoding_pool: Option<&ThreadPool>,
+    parallel_encoding_min_transactions: usize,
 ) -> Result<Vec<SubscribeUpdate>, PluginError> {
+    let metadata = UpdateMetadata::new(event);
     let mut updates = match &event.payload {
         PluginEvent::BlockAccepted(block) => vec![new_update(
-            event,
+            &metadata,
             EventType::BlockAccepted,
             subscribe_update::Update::Block(encode_block(block, false)?),
         )],
         PluginEvent::BlockFinalized(block) => vec![new_update(
-            event,
+            &metadata,
             EventType::BlockFinalized,
             subscribe_update::Update::Block(encode_block(block, true)?),
         )],
         PluginEvent::BestChainChanged(change) => vec![new_update(
-            event,
+            &metadata,
             EventType::BestChainChanged,
             subscribe_update::Update::BestChain(encode_best_chain(change)),
         )],
@@ -50,7 +55,7 @@ pub(crate) fn encode_event(
                 MempoolEventKind::Mined => MempoolAction::Mined,
             };
             vec![new_update(
-                event,
+                &metadata,
                 EventType::MempoolChanged,
                 subscribe_update::Update::Mempool(MempoolUpdate {
                     action: action.into(),
@@ -67,19 +72,27 @@ pub(crate) fn encode_event(
     match &event.payload {
         PluginEvent::BlockAccepted(block) => append_block_updates(
             &mut updates,
-            event,
+            &metadata,
             block,
-            BlockCommitment::Accepted,
-            transaction_updates,
-            utxo_updates,
+            BlockEncodingOptions {
+                commitment: BlockCommitment::Accepted,
+                transaction_updates,
+                utxo_updates,
+                encoding_pool,
+                parallel_encoding_min_transactions,
+            },
         )?,
         PluginEvent::BlockFinalized(block) => append_block_updates(
             &mut updates,
-            event,
+            &metadata,
             block,
-            BlockCommitment::Finalized,
-            transaction_updates,
-            utxo_updates,
+            BlockEncodingOptions {
+                commitment: BlockCommitment::Finalized,
+                transaction_updates,
+                utxo_updates,
+                encoding_pool,
+                parallel_encoding_min_transactions,
+            },
         )?,
         PluginEvent::BestChainChanged(_) | PluginEvent::MempoolChanged(_) => {}
     }
@@ -87,86 +100,149 @@ pub(crate) fn encode_event(
     Ok(updates)
 }
 
-fn append_block_updates(
-    updates: &mut Vec<SubscribeUpdate>,
-    event: &EventEnvelope,
-    block: &BlockEvent,
+#[derive(Clone, Copy)]
+struct BlockEncodingOptions<'a> {
     commitment: BlockCommitment,
     transaction_updates: bool,
     utxo_updates: bool,
+    encoding_pool: Option<&'a ThreadPool>,
+    parallel_encoding_min_transactions: usize,
+}
+
+fn append_block_updates(
+    updates: &mut Vec<SubscribeUpdate>,
+    metadata: &UpdateMetadata,
+    block: &BlockEvent,
+    options: BlockEncodingOptions<'_>,
 ) -> Result<(), PluginError> {
-    if !transaction_updates && !utxo_updates {
+    if !options.transaction_updates && !options.utxo_updates {
         return Ok(());
     }
 
-    for (transaction_index, transaction) in block.block.transactions.iter().enumerate() {
-        let transaction_index = u32::try_from(transaction_index).map_err(|_| {
-            PluginError::new("transaction index exceeds the gRPC protocol's u32 range")
-        })?;
-        let (transaction_id, auth_digest) = transaction.txid_and_auth_digest();
-        let EncodedTransparentUpdates {
-            transaction_inputs,
-            transaction_outputs,
-            utxo_changes,
-            transparent_input_value_zat,
-            transparent_output_value_zat,
-        } = encode_transparent_updates(
-            transaction,
-            transaction_id,
-            &block.network,
-            &block.spent_outputs,
-            transaction_updates,
-            utxo_updates,
-        )?;
-
-        if transaction_updates {
-            let unmined_transaction_id = encode_unmined_transaction_id(transaction_id, auth_digest);
-            let transaction_bytes = transaction.zcash_serialize_to_vec().map_err(|error| {
-                PluginError::new(format!("failed to encode transaction: {error}"))
-            })?;
-            updates.push(new_update(
-                event,
-                EventType::Transaction,
-                subscribe_update::Update::Transaction(TransactionUpdate {
-                    transaction_id: transaction_id.to_string(),
-                    unmined_transaction_id,
-                    auth_digest: auth_digest.map(|digest| digest.to_string()),
-                    transaction: transaction_bytes.into(),
-                    height: block.height.0,
-                    block_hash: block.hash.to_string(),
-                    transaction_index,
-                    commitment: commitment.into(),
-                    coinbase: transaction.is_coinbase(),
-                    transparent_inputs: transaction_inputs,
-                    transparent_outputs: transaction_outputs,
-                    version: transaction.version(),
-                    lock_time: transaction.raw_lock_time(),
-                    lock_time_is_time: transaction.lock_time_is_time(),
-                    expiry_height: transaction.expiry_height().map(|height| height.0),
-                    network: block.network.to_string(),
-                    transparent_input_value_zat,
-                    transparent_output_value_zat,
-                }),
-            ));
-        }
-
-        if utxo_updates && !utxo_changes.is_empty() {
-            updates.push(new_update(
-                event,
-                EventType::Utxo,
-                subscribe_update::Update::Utxo(UtxoUpdate {
-                    height: block.height.0,
-                    block_hash: block.hash.to_string(),
-                    transaction_id: transaction_id.to_string(),
-                    transaction_index,
-                    commitment: commitment.into(),
-                    changes: utxo_changes,
-                }),
-            ));
-        }
-    }
+    let block_hash = block.hash.to_string();
+    let network = block.network.to_string();
+    let encode = |(transaction_index, transaction): (usize, &Arc<Transaction>)| {
+        encode_transaction_updates(
+            metadata,
+            block,
+            &block_hash,
+            &network,
+            options.commitment,
+            options.transaction_updates,
+            options.utxo_updates,
+            transaction_index,
+            transaction.as_ref(),
+        )
+    };
+    let encoded = if let Some(pool) = options
+        .encoding_pool
+        .filter(|_| block.block.transactions.len() >= options.parallel_encoding_min_transactions)
+    {
+        metrics::counter!("plugin.grpc.encoding.blocks.total", "mode" => "parallel").increment(1);
+        pool.install(|| {
+            block
+                .block
+                .transactions
+                .par_iter()
+                .enumerate()
+                .map(encode)
+                .collect::<Result<Vec<_>, PluginError>>()
+        })?
+    } else {
+        metrics::counter!("plugin.grpc.encoding.blocks.total", "mode" => "sequential").increment(1);
+        block
+            .block
+            .transactions
+            .iter()
+            .enumerate()
+            .map(encode)
+            .collect::<Result<Vec<_>, PluginError>>()?
+    };
+    updates.extend(encoded.into_iter().flatten());
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_transaction_updates(
+    metadata: &UpdateMetadata,
+    block: &BlockEvent,
+    block_hash: &str,
+    network: &str,
+    commitment: BlockCommitment,
+    transaction_updates: bool,
+    utxo_updates: bool,
+    transaction_index: usize,
+    transaction: &Transaction,
+) -> Result<Vec<SubscribeUpdate>, PluginError> {
+    let transaction_index = u32::try_from(transaction_index)
+        .map_err(|_| PluginError::new("transaction index exceeds the gRPC protocol's u32 range"))?;
+    let (transaction_id, auth_digest) = transaction.txid_and_auth_digest();
+    let transaction_id_string = transaction_id.to_string();
+    let EncodedTransparentUpdates {
+        transaction_inputs,
+        transaction_outputs,
+        utxo_changes,
+        transparent_input_value_zat,
+        transparent_output_value_zat,
+    } = encode_transparent_updates(
+        transaction,
+        &transaction_id_string,
+        &block.network,
+        &block.spent_outputs,
+        transaction_updates,
+        utxo_updates,
+    )?;
+    let mut updates =
+        Vec::with_capacity(usize::from(transaction_updates) + usize::from(utxo_updates));
+
+    if transaction_updates {
+        let unmined_transaction_id = encode_unmined_transaction_id(transaction_id, auth_digest);
+        let transaction_bytes = transaction
+            .zcash_serialize_to_vec()
+            .map_err(|error| PluginError::new(format!("failed to encode transaction: {error}")))?;
+        updates.push(new_update(
+            metadata,
+            EventType::Transaction,
+            subscribe_update::Update::Transaction(TransactionUpdate {
+                transaction_id: transaction_id_string.clone(),
+                unmined_transaction_id,
+                auth_digest: auth_digest.map(|digest| digest.to_string()),
+                transaction: transaction_bytes.into(),
+                height: block.height.0,
+                block_hash: block_hash.to_owned(),
+                transaction_index,
+                commitment: commitment.into(),
+                coinbase: transaction.is_coinbase(),
+                transparent_inputs: transaction_inputs,
+                transparent_outputs: transaction_outputs,
+                version: transaction.version(),
+                lock_time: transaction.raw_lock_time(),
+                lock_time_is_time: transaction.lock_time_is_time(),
+                expiry_height: transaction.expiry_height().map(|height| height.0),
+                network: network.to_owned(),
+                transparent_input_value_zat,
+                transparent_output_value_zat,
+            }),
+        ));
+    }
+
+    if utxo_updates && !utxo_changes.is_empty() {
+        updates.push(new_update(
+            metadata,
+            EventType::Utxo,
+            subscribe_update::Update::Utxo(UtxoUpdate {
+                height: block.height.0,
+                block_hash: block_hash.to_owned(),
+                transaction_id: transaction_id_string,
+                transaction_index,
+                commitment: commitment.into(),
+                changes: utxo_changes,
+            }),
+        ));
+    }
+
+    Ok(updates)
 }
 
 struct EncodedTransparentUpdates {
@@ -195,7 +271,7 @@ struct EncodedPreviousOutput {
 
 fn encode_transparent_updates(
     transaction: &Transaction,
-    transaction_id: transaction::Hash,
+    transaction_id_string: &str,
     network: &Network,
     spent_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     transaction_updates: bool,
@@ -255,7 +331,7 @@ fn encode_transparent_updates(
             &context,
             output,
             output_index,
-            transaction_id,
+            transaction_id_string,
             &mut transaction_outputs,
             &mut utxo_changes,
         );
@@ -353,7 +429,7 @@ fn encode_transparent_output(
     context: &TransparentEncodingContext<'_>,
     output: &transparent::Output,
     output_index: u32,
-    transaction_id: transaction::Hash,
+    transaction_id: &str,
     transaction_outputs: &mut Vec<TransparentOutput>,
     utxo_changes: &mut Vec<UtxoChange>,
 ) -> u64 {
@@ -376,7 +452,7 @@ fn encode_transparent_output(
         utxo_changes.push(UtxoChange {
             change: Some(utxo_change::Change::Created(UtxoCreated {
                 outpoint: Some(Outpoint {
-                    transaction_id: transaction_id.to_string(),
+                    transaction_id: transaction_id.to_owned(),
                     output_index,
                 }),
                 value_zat,
@@ -420,19 +496,38 @@ fn encode_unmined_transaction_id(
     )
 }
 
+#[derive(Clone, Debug)]
+struct UpdateMetadata {
+    schema_version: u32,
+    session_id: Bytes,
+    observed_at: Timestamp,
+    source_sequence: u64,
+}
+
+impl UpdateMetadata {
+    fn new(event: &EventEnvelope) -> Self {
+        Self {
+            schema_version: event.schema_version,
+            session_id: Bytes::copy_from_slice(&event.session_id.0.to_be_bytes()),
+            observed_at: timestamp(event.observed_at),
+            source_sequence: event.sequence,
+        }
+    }
+}
+
 fn new_update(
-    event: &EventEnvelope,
+    metadata: &UpdateMetadata,
     event_type: EventType,
     update: subscribe_update::Update,
 ) -> SubscribeUpdate {
     SubscribeUpdate {
-        schema_version: event.schema_version,
-        session_id: Bytes::copy_from_slice(&event.session_id.0.to_be_bytes()),
+        schema_version: metadata.schema_version,
+        session_id: metadata.session_id.clone(),
         sequence: 0,
-        observed_at: Some(timestamp(event.observed_at)),
+        observed_at: Some(metadata.observed_at),
         event_type: event_type.into(),
         filters: Vec::new(),
-        source_sequence: event.sequence,
+        source_sequence: metadata.source_sequence,
         update: Some(update),
     }
 }
@@ -550,7 +645,7 @@ mod tests {
 
         let encoded = encode_transparent_updates(
             &transaction,
-            transaction_id,
+            &transaction_id.to_string(),
             &network,
             &spent_outputs,
             true,
@@ -624,7 +719,7 @@ mod tests {
 
         let encoded = encode_transparent_updates(
             &transaction,
-            transaction.hash(),
+            &transaction.hash().to_string(),
             &Network::Mainnet,
             &HashMap::new(),
             true,

@@ -20,3 +20,15 @@ so the connection continues from replay into live delivery. Use
 `--max-updates` for finite smoke tests. Use `--x-token` (or
 `ZAKURA_GRPC_X_TOKEN`), `--gzip`, and `--subscription-id` to exercise the
 corresponding production client options.
+
+Use the load-test binary for aggregate throughput, bandwidth, and latency
+measurements without per-message terminal output:
+
+```sh
+cargo run --release -p zakura-grpc-client-example --bin load-test -- \
+  --clients 10 --duration-seconds 60 \
+  --event transaction --event utxo
+```
+
+Use `--gzip`, `--from-height`, and `--reconnect` to benchmark those delivery
+paths separately.

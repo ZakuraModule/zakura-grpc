@@ -18,7 +18,9 @@ clap = { workspace = true }
 futures-core = { workspace = true }
 metrics = { workspace = true }
 parking_lot = { workspace = true }
+prost = { workspace = true }
 prost-types = { workspace = true }
+rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

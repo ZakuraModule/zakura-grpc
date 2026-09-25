@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 clap = { workspace = true }
+prost = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 zakura-grpc-client = { workspace = true }
@@ -23,3 +24,6 @@ workspace = true
 name = "client"
 path = "src/bin/client.rs"
 
+[[bin]]
+name = "load-test"
+path = "src/bin/load-test.rs"

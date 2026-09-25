@@ -9,9 +9,15 @@ mod event;
 mod filter;
 mod server;
 
-use std::{fmt, net::TcpListener as StdTcpListener, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    net::TcpListener as StdTcpListener,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 pub use config::{Compression, CompressionConfig, Config, ConfigError, FilterLimits};
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use server::{GrpcService, SharedState};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -47,6 +53,7 @@ pub struct GrpcPlugin {
     subscriptions: EventSubscriptions,
     state: Arc<SharedState>,
     next_sequence: u64,
+    encoding_pool: Option<ThreadPool>,
     shutdown: Option<CancellationToken>,
     server: Option<JoinHandle<()>>,
 }
@@ -61,6 +68,7 @@ impl GrpcPlugin {
             subscriptions,
             state,
             next_sequence: 0,
+            encoding_pool: None,
             shutdown: None,
             server: None,
         }
@@ -90,6 +98,16 @@ impl GeyserPlugin for GrpcPlugin {
     fn on_load(&mut self) -> PluginResult {
         if self.server.is_some() {
             return Err(PluginError::new("Zakura gRPC plugin is already running"));
+        }
+        if self.config.event_encoding_threads > 1 && self.encoding_pool.is_none() {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(self.config.event_encoding_threads)
+                .thread_name(|index| format!("zakura-grpc-encode-{index}"))
+                .build()
+                .map_err(|error| {
+                    PluginError::new(format!("failed to create gRPC encoding pool: {error}"))
+                })?;
+            self.encoding_pool = Some(pool);
         }
 
         let runtime = tokio::runtime::Handle::try_current()
@@ -151,12 +169,23 @@ impl GeyserPlugin for GrpcPlugin {
     }
 
     fn on_event(&mut self, event: Arc<EventEnvelope>) -> PluginResult {
-        let updates = event::encode_event(
+        let event_kind = event.kind().as_str();
+        let handler_started = Instant::now();
+        let encode_started = Instant::now();
+        let encoded = event::encode_event(
             &event,
             self.config.transaction_updates,
             self.config.utxo_updates,
-        )?;
-        for mut update in updates {
+            self.encoding_pool.as_ref(),
+            self.config.parallel_encoding_min_transactions,
+        );
+        metrics::histogram!("plugin.grpc.encode.duration", "event" => event_kind)
+            .record(encode_started.elapsed().as_secs_f64());
+        let mut updates = encoded?;
+        metrics::histogram!("plugin.grpc.updates.per_event", "event" => event_kind)
+            .record(u32::try_from(updates.len()).map_or(f64::from(u32::MAX), f64::from));
+
+        for update in &mut updates {
             self.next_sequence = self
                 .next_sequence
                 .checked_add(1)
@@ -167,13 +196,22 @@ impl GeyserPlugin for GrpcPlugin {
                 "event" => update.event_type.to_string()
             )
             .increment(1);
-            self.state.publish(update);
+        }
+        let publish_started = Instant::now();
+        self.state.publish_batch(updates);
+        metrics::histogram!("plugin.grpc.publish.duration", "event" => event_kind)
+            .record(publish_started.elapsed().as_secs_f64());
+        if let Ok(event_age) = event.observed_at.elapsed() {
+            metrics::histogram!("plugin.grpc.event_to_publish.duration", "event" => event_kind)
+                .record(event_age.as_secs_f64());
         }
         metrics::counter!(
             "plugin.grpc.events.total",
-            "event" => event.kind().as_str()
+            "event" => event_kind
         )
         .increment(1);
+        metrics::histogram!("plugin.grpc.handler.duration", "event" => event_kind)
+            .record(handler_started.elapsed().as_secs_f64());
         Ok(())
     }
 

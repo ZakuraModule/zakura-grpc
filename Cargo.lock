@@ -3654,6 +3654,7 @@ name = "zakura-grpc-client-example"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "prost",
  "tokio",
  "tonic",
  "zakura-grpc-client",
@@ -3669,7 +3670,9 @@ dependencies = [
  "futures-core",
  "metrics",
  "parking_lot",
+ "prost",
  "prost-types",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror",
