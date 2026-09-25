@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    future::pending,
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -8,15 +9,18 @@ use std::{
 use futures_core::Stream;
 use parking_lot::Mutex;
 use prost::Message;
-use tokio::sync::{broadcast, mpsc};
+use tokio::{
+    sync::{broadcast, mpsc},
+    time::MissedTickBehavior,
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 use zakura_grpc_proto::geyser::{
     geyser_server::{Geyser, GeyserServer},
-    subscribe_update, EventType, GetVersionRequest, GetVersionResponse, PingRequest, PongResponse,
-    PongUpdate, SubscribeReplayInfoRequest, SubscribeReplayInfoResponse, SubscribeRequest,
-    SubscribeUpdate,
+    subscribe_update, EventType, GetVersionRequest, GetVersionResponse, PingRequest, PingUpdate,
+    PongResponse, PongUpdate, SubscribeReplayInfoRequest, SubscribeReplayInfoResponse,
+    SubscribeRequest, SubscribeUpdate,
 };
 
 use crate::{
@@ -305,12 +309,50 @@ fn event_type_label(event_type: i32) -> &'static str {
         .as_str_name()
 }
 
+enum PingSend {
+    Sent(i32),
+    Skipped,
+    Closed,
+}
+
+fn subscription_pong(id: i32) -> SubscribeUpdate {
+    SubscribeUpdate {
+        event_type: EventType::Unspecified.into(),
+        update: Some(subscribe_update::Update::Pong(PongUpdate { id })),
+        ..SubscribeUpdate::default()
+    }
+}
+
+fn send_subscription_ping(outbound: &mpsc::Sender<SubscribeResult>, ping_id: i32) -> PingSend {
+    let ping = SubscribeUpdate {
+        event_type: EventType::Unspecified.into(),
+        update: Some(subscribe_update::Update::Ping(PingUpdate { id: ping_id })),
+        ..SubscribeUpdate::default()
+    };
+    match outbound.try_send(Ok(ping)) {
+        Ok(()) => {
+            metrics::counter!("plugin.grpc.subscription_pings.total").increment(1);
+            PingSend::Sent(ping_id.checked_sub(1).unwrap_or(-1))
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            metrics::counter!(
+                "plugin.grpc.subscription_pings.skipped.total",
+                "reason" => "outbound_queue_full"
+            )
+            .increment(1);
+            PingSend::Skipped
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => PingSend::Closed,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct GrpcService {
     state: Arc<SharedState>,
     auth: TokenAuth,
     subscriptions: SubscriptionTracker,
     filter_limits: Arc<FilterLimits>,
+    subscription_ping_interval: Option<Duration>,
 }
 
 impl GrpcService {
@@ -323,6 +365,9 @@ impl GrpcService {
                 config.subscription_limit_enforce,
             ),
             filter_limits: Arc::new(config.filter_limits.clone()),
+            subscription_ping_interval: config
+                .subscription_ping_interval_seconds
+                .map(Duration::from_secs),
         }
     }
 
@@ -359,6 +404,7 @@ impl Geyser for GrpcService {
         let (mut live, replay) = self.state.subscribe(initial.from_height)?;
         let (outbound_tx, outbound_rx) = mpsc::channel(self.state.client_channel_capacity);
         let filter_limits = Arc::clone(&self.filter_limits);
+        let subscription_ping_interval = self.subscription_ping_interval;
 
         metrics::counter!("plugin.grpc.connections.total").increment(1);
         tokio::spawn(async move {
@@ -370,18 +416,19 @@ impl Geyser for GrpcService {
             }
 
             let mut replay_watermark = replay.watermark;
+            let mut ping_interval = subscription_ping_interval.map(tokio::time::interval);
+            if let Some(interval) = ping_interval.as_mut() {
+                interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                interval.tick().await;
+            }
+            let mut ping_id = -1i32;
             loop {
                 tokio::select! {
                     request = inbound.message() => {
                         match request {
                             Ok(Some(request)) => {
                                 if let Some(ping) = request.ping {
-                                    let pong = SubscribeUpdate {
-                                        event_type: EventType::Unspecified.into(),
-                                        update: Some(subscribe_update::Update::Pong(PongUpdate { id: ping.id })),
-                                        ..SubscribeUpdate::default()
-                                    };
-                                    if outbound_tx.send(Ok(pong)).await.is_err() {
+                                    if outbound_tx.send(Ok(subscription_pong(ping.id))).await.is_err() {
                                         break;
                                     }
                                 } else {
@@ -425,6 +472,20 @@ impl Geyser for GrpcService {
                                 break;
                             }
                             Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    () = async {
+                        match ping_interval.as_mut() {
+                            Some(interval) => {
+                                interval.tick().await;
+                            }
+                            None => pending::<()>().await,
+                        }
+                    } => {
+                        match send_subscription_ping(&outbound_tx, ping_id) {
+                            PingSend::Sent(next_ping_id) => ping_id = next_ping_id,
+                            PingSend::Skipped => {}
+                            PingSend::Closed => break,
                         }
                     }
                 }

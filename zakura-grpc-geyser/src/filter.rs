@@ -226,9 +226,12 @@ fn update_matches_transaction_id(
                     .iter()
                     .any(|transaction_id| transaction_ids.contains(transaction_id))
             }),
-        Some(subscribe_update::Update::Block(_) | subscribe_update::Update::Pong(_)) | None => {
-            false
-        }
+        Some(
+            subscribe_update::Update::Block(_)
+            | subscribe_update::Update::Ping(_)
+            | subscribe_update::Update::Pong(_),
+        )
+        | None => false,
     }
 }
 
@@ -281,6 +284,7 @@ fn update_matches_transparent_address(
             subscribe_update::Update::Block(_)
             | subscribe_update::Update::BestChain(_)
             | subscribe_update::Update::Mempool(_)
+            | subscribe_update::Update::Ping(_)
             | subscribe_update::Update::Pong(_),
         )
         | None => false,

@@ -19,10 +19,10 @@ use zakura_geyser_plugin_interface::{
 };
 use zakura_grpc_proto::geyser::{
     best_chain_update, subscribe_update, transparent_input, utxo_change, BestChainGrow,
-    BestChainReset, BestChainUpdate, BlockCommitment, BlockUpdate, EventType, MempoolAction,
-    MempoolTransactionUpdate, MempoolUpdate, Outpoint, SubscribeUpdate, TransactionUpdate,
-    TransparentCoinbaseInput, TransparentInput, TransparentOutput, TransparentPrevoutInput,
-    UtxoChange, UtxoCreated, UtxoSpent, UtxoUpdate,
+    BestChainReset, BestChainUpdate, BlockCommitment, BlockUpdate, CanonicalBlock, EventType,
+    MempoolAction, MempoolTransactionUpdate, MempoolUpdate, Outpoint, SubscribeUpdate,
+    TransactionUpdate, TransparentCoinbaseInput, TransparentInput, TransparentOutput,
+    TransparentPrevoutInput, UtxoChange, UtxoCreated, UtxoSpent, UtxoUpdate,
 };
 
 pub(crate) fn encode_event(
@@ -704,11 +704,37 @@ fn encode_best_chain(change: &BestChainChange) -> BestChainUpdate {
                 transaction_ids: transaction_ids.iter().map(ToString::to_string).collect(),
             })),
         },
-        BestChainChange::Reset { height, hash } => BestChainUpdate {
+        BestChainChange::Reset {
+            height,
+            hash,
+            disconnected_blocks,
+            connected_blocks,
+            diff_complete,
+        } => BestChainUpdate {
             height: height.0,
             hash: hash.to_string(),
-            change: Some(best_chain_update::Change::Reset(BestChainReset {})),
+            change: Some(best_chain_update::Change::Reset(BestChainReset {
+                disconnected_blocks: disconnected_blocks
+                    .iter()
+                    .map(encode_canonical_block)
+                    .collect(),
+                connected_blocks: connected_blocks
+                    .iter()
+                    .map(encode_canonical_block)
+                    .collect(),
+                diff_complete: *diff_complete,
+            })),
         },
+    }
+}
+
+fn encode_canonical_block(
+    block: &zakura_geyser_plugin_interface::CanonicalBlock,
+) -> CanonicalBlock {
+    CanonicalBlock {
+        height: block.height.0,
+        hash: block.hash.to_string(),
+        previous_block_hash: block.previous_block_hash.to_string(),
     }
 }
 
@@ -729,6 +755,7 @@ pub(crate) fn block_height(update: &SubscribeUpdate) -> Option<u32> {
         subscribe_update::Update::Utxo(utxo) => Some(utxo.height),
         subscribe_update::Update::Mempool(_)
         | subscribe_update::Update::MempoolTransaction(_)
+        | subscribe_update::Update::Ping(_)
         | subscribe_update::Update::Pong(_) => None,
     }
 }
@@ -744,10 +771,57 @@ mod tests {
         transparent::{Address, Input, OrderedUtxo, OutPoint, Output, Script},
     };
     use zakura_geyser_plugin_interface::{
-        EventEnvelope, MempoolEvent, MempoolEventKind, PluginEvent, SessionId, EVENT_SCHEMA_VERSION,
+        BestChainChange, CanonicalBlock as InterfaceCanonicalBlock, EventEnvelope, MempoolEvent,
+        MempoolEventKind, PluginEvent, SessionId, EVENT_SCHEMA_VERSION,
     };
 
     use super::*;
+
+    #[test]
+    fn encodes_atomic_canonical_reorg_diff() {
+        let disconnected = InterfaceCanonicalBlock {
+            height: Height(11),
+            hash: zakura_chain::block::Hash([11; 32]),
+            previous_block_hash: zakura_chain::block::Hash([10; 32]),
+        };
+        let connected = InterfaceCanonicalBlock {
+            height: Height(11),
+            hash: zakura_chain::block::Hash([21; 32]),
+            previous_block_hash: zakura_chain::block::Hash([10; 32]),
+        };
+        let event = EventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            session_id: SessionId(7),
+            sequence: 11,
+            observed_at: SystemTime::UNIX_EPOCH,
+            payload: PluginEvent::BestChainChanged(BestChainChange::Reset {
+                height: connected.height,
+                hash: connected.hash,
+                disconnected_blocks: vec![disconnected].into(),
+                connected_blocks: vec![connected].into(),
+                diff_complete: true,
+            }),
+        };
+
+        let updates = encode_event(&event, true, true, true, None, 32).unwrap();
+        let Some(subscribe_update::Update::BestChain(best_chain)) = updates[0].update.as_ref()
+        else {
+            panic!("best-chain event must encode as a best-chain update");
+        };
+        let Some(best_chain_update::Change::Reset(reset)) = best_chain.change.as_ref() else {
+            panic!("reset event must retain its canonical-chain diff");
+        };
+
+        assert!(reset.diff_complete);
+        assert_eq!(reset.disconnected_blocks.len(), 1);
+        assert_eq!(reset.disconnected_blocks[0].height, 11);
+        assert_eq!(
+            reset.disconnected_blocks[0].hash,
+            disconnected.hash.to_string()
+        );
+        assert_eq!(reset.connected_blocks.len(), 1);
+        assert_eq!(reset.connected_blocks[0].hash, connected.hash.to_string());
+    }
 
     #[test]
     fn encodes_transaction_and_ordered_utxo_changes() {

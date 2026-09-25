@@ -32,6 +32,10 @@ pub struct Config {
     pub broadcast_capacity: usize,
     /// Bounded outbound queue capacity for each connected client.
     pub client_channel_capacity: usize,
+    /// Interval in seconds for server-originated subscription pings.
+    ///
+    /// The default is 15 seconds; `None` disables pings for embedded configurations.
+    pub subscription_ping_interval_seconds: Option<u64>,
     /// Maximum decoded inbound gRPC message size in bytes.
     pub max_decoding_message_size: usize,
     /// Maximum encoded outbound gRPC message size in bytes.
@@ -79,6 +83,9 @@ impl Config {
         if self.client_channel_capacity == 0 {
             return Err(ConfigError::ZeroClientChannelCapacity);
         }
+        if self.subscription_ping_interval_seconds == Some(0) {
+            return Err(ConfigError::ZeroSubscriptionPingInterval);
+        }
         if self.max_decoding_message_size == 0 {
             return Err(ConfigError::ZeroMaxDecodingMessageSize);
         }
@@ -119,6 +126,7 @@ impl Default for Config {
             replay_max_age_seconds: Some(4 * 60 * 60),
             broadcast_capacity: 100_000,
             client_channel_capacity: 10_000,
+            subscription_ping_interval_seconds: Some(15),
             max_decoding_message_size: 4 * 1024 * 1024,
             max_encoding_message_size: 50 * 1024 * 1024,
             compression: CompressionConfig::default(),
@@ -246,6 +254,9 @@ pub enum ConfigError {
     /// Every client needs a bounded non-empty outbound queue.
     #[error("client_channel_capacity must be greater than zero")]
     ZeroClientChannelCapacity,
+    /// An enabled application keepalive needs a positive interval.
+    #[error("subscription_ping_interval_seconds must be greater than zero when configured")]
+    ZeroSubscriptionPingInterval,
     /// Tonic must accept at least one byte per inbound request.
     #[error("max_decoding_message_size must be greater than zero")]
     ZeroMaxDecodingMessageSize,
@@ -353,6 +364,19 @@ mod tests {
         assert_eq!(
             no_threshold.validate(),
             Err(ConfigError::ZeroParallelEncodingMinTransactions)
+        );
+    }
+
+    #[test]
+    fn zero_subscription_ping_interval_is_rejected() {
+        let config = Config {
+            subscription_ping_interval_seconds: Some(0),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::ZeroSubscriptionPingInterval)
         );
     }
 }

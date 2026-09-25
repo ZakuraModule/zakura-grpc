@@ -76,6 +76,7 @@ replay_max_bytes = 536870912
 replay_max_age_seconds = 14400
 broadcast_capacity = 100000
 client_channel_capacity = 10000
+subscription_ping_interval_seconds = 15
 max_decoding_message_size = 4194304
 max_encoding_message_size = 52428800
 compression = { accept = ["gzip", "zstd"], send = ["gzip", "zstd"] }
@@ -246,6 +247,8 @@ height has been evicted, the server returns `OUT_OF_RANGE`; clients can query
 - The live broadcast ring and every client queue are bounded.
 - The replay window has independent height, event, byte, and age limits.
 - Lagging clients are disconnected and can reconnect using `from_height`.
+- The server sends application-level pings at the configured interval; the Rust
+  client replies automatically and hides reserved keepalive messages.
 - Replay data disappears when the node restarts.
 - Full mempool transaction updates are live-only and are never inserted into
   the block-height replay window.
@@ -260,6 +263,9 @@ height has been evicted, the server returns `OUT_OF_RANGE`; clients can query
   available.
 - UTXO payloads contain ordered transparent create/spend effects. Spend updates
   carry the same optional verified previous-output context.
+- Best-chain resets contain an atomic canonical diff: disconnected blocks are
+  tip-first, connected blocks are ancestor-first, and `diff_complete = false`
+  tells consumers to recover with historical backfill.
 - Binary protobuf fields use reference-counted buffers, so cloning an update for
   replay and multiple subscribers does not copy block, transaction, or script
   bytes. Protobuf size is calculated once per update, replay stores event

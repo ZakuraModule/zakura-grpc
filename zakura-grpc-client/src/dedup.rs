@@ -89,6 +89,7 @@ pub(crate) fn update_height(update: &SubscribeUpdate) -> Option<u32> {
         subscribe_update::Update::Utxo(utxo) => Some(utxo.height),
         subscribe_update::Update::Mempool(_)
         | subscribe_update::Update::MempoolTransaction(_)
+        | subscribe_update::Update::Ping(_)
         | subscribe_update::Update::Pong(_) => None,
     }
 }

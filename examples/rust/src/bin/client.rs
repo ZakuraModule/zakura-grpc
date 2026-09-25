@@ -199,10 +199,29 @@ fn print_update(update: &SubscribeUpdate) {
             block.block.len(),
             block.finalized
         ),
-        Some(subscribe_update::Update::BestChain(change)) => println!(
-            "sequence={} event={} filters={:?} height={} hash={}",
-            update.sequence, event_type, update.filters, change.height, change.hash
-        ),
+        Some(subscribe_update::Update::BestChain(change)) => {
+            match change.change.as_ref() {
+                Some(zakura_grpc_proto::geyser::best_chain_update::Change::Grow(_)) => println!(
+                    "sequence={} event={} filters={:?} height={} hash={} change=grow",
+                    update.sequence, event_type, update.filters, change.height, change.hash
+                ),
+                Some(zakura_grpc_proto::geyser::best_chain_update::Change::Reset(reset)) => println!(
+                    "sequence={} event={} filters={:?} height={} hash={} change=reset disconnected={} connected={} diff_complete={}",
+                    update.sequence,
+                    event_type,
+                    update.filters,
+                    change.height,
+                    change.hash,
+                    reset.disconnected_blocks.len(),
+                    reset.connected_blocks.len(),
+                    reset.diff_complete
+                ),
+                None => println!(
+                    "sequence={} event={} filters={:?} height={} hash={} change=none",
+                    update.sequence, event_type, update.filters, change.height, change.hash
+                ),
+            }
+        }
         Some(subscribe_update::Update::Mempool(change)) => println!(
             "sequence={} event={} action={} transactions={}",
             update.sequence,
@@ -253,6 +272,9 @@ fn print_update(update: &SubscribeUpdate) {
                     None => println!("  utxo_change payload=none"),
                 }
             }
+        }
+        Some(subscribe_update::Update::Ping(ping)) => {
+            println!("event=server-ping id={}", ping.id);
         }
         Some(subscribe_update::Update::Pong(pong)) => {
             println!("subscription_pong id={}", pong.id);

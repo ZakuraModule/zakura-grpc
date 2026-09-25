@@ -4,7 +4,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Endpoint, Code, Status, Streaming};
 use tracing::warn;
-use zakura_grpc_proto::geyser::{SubscribeRequest, SubscribeUpdate};
+use zakura_grpc_proto::geyser::{
+    subscribe_update, SubscribeRequest, SubscribeRequestPing, SubscribeUpdate,
+};
 
 use crate::{
     dedup::update_height, geyser_client, ClientOptions, DedupState, MetadataInterceptor,
@@ -103,6 +105,43 @@ enum Disconnect {
     Status(Status),
 }
 
+async fn handle_update(
+    active: &mut ActiveSubscription,
+    output: &mpsc::Sender<Result<SubscribeUpdate, Status>>,
+    checkpoint: &mut Option<u32>,
+    dedup: &mut Option<DedupState>,
+    update: SubscribeUpdate,
+) -> Result<Option<Disconnect>, ()> {
+    match update.update.as_ref() {
+        Some(subscribe_update::Update::Ping(ping)) => {
+            let response = SubscribeRequest {
+                ping: Some(SubscribeRequestPing { id: ping.id }),
+                ..SubscribeRequest::default()
+            };
+            if active.requests.send(response).await.is_err() {
+                Ok(Some(Disconnect::Status(Status::unavailable(
+                    "subscription request stream closed while replying to server ping",
+                ))))
+            } else {
+                Ok(None)
+            }
+        }
+        Some(subscribe_update::Update::Pong(pong)) if pong.id < 0 => Ok(None),
+        _ => {
+            if let Some(height) = update_height(&update) {
+                *checkpoint = Some(height);
+            }
+            if dedup.as_mut().is_none_or(|state| state.observe(&update))
+                && output.send(Ok(update)).await.is_err()
+            {
+                Err(())
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_subscription(
     updates: Streaming<SubscribeUpdate>,
@@ -166,17 +205,16 @@ async fn run_subscription(
                 None
             },
             message = active.updates.message() => match message {
-                Ok(Some(update)) => {
-                    if let Some(height) = update_height(&update) {
-                        checkpoint = Some(height);
-                    }
-                    if dedup.as_mut().is_none_or(|state| state.observe(&update))
-                        && output.send(Ok(update)).await.is_err()
-                    {
-                        break;
-                    }
-                    None
-                }
+                Ok(Some(update)) => match handle_update(
+                    &mut active,
+                    &output,
+                    &mut checkpoint,
+                    &mut dedup,
+                    update,
+                ).await {
+                    Ok(disconnect) => disconnect,
+                    Err(()) => break,
+                },
                 Ok(None) => Some(Disconnect::Ended),
                 Err(status) => Some(Disconnect::Status(status)),
             },

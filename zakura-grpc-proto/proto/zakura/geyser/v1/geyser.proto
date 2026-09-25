@@ -69,6 +69,7 @@ message SubscribeUpdate {
     TransactionUpdate transaction = 14;
     UtxoUpdate utxo = 15;
     MempoolTransactionUpdate mempool_transaction = 16;
+    PingUpdate ping = 17;
   }
 }
 
@@ -105,7 +106,21 @@ message BestChainGrow {
   repeated string transaction_ids = 2;
 }
 
-message BestChainReset {}
+message CanonicalBlock {
+  uint32 height = 1;
+  string hash = 2;
+  string previous_block_hash = 3;
+}
+
+message BestChainReset {
+  // Removed canonical blocks, ordered from the old tip down to the fork point.
+  repeated CanonicalBlock disconnected_blocks = 1;
+  // Added canonical blocks, ordered from the fork point up to the new tip.
+  repeated CanonicalBlock connected_blocks = 2;
+  // False means the client must backfill because no retained common ancestor
+  // was available when this transition was produced.
+  bool diff_complete = 3;
+}
 
 enum MempoolAction {
   MEMPOOL_ACTION_UNSPECIFIED = 0;
@@ -255,6 +270,11 @@ message UtxoUpdate {
 }
 
 message PongUpdate {
+  int32 id = 1;
+}
+
+message PingUpdate {
+  // Negative IDs are reserved for server-originated keepalives.
   int32 id = 1;
 }
 
