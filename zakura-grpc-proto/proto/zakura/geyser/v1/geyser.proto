@@ -17,6 +17,8 @@ enum EventType {
   EVENT_TYPE_BEST_CHAIN_CHANGED = 2;
   EVENT_TYPE_BLOCK_FINALIZED = 3;
   EVENT_TYPE_MEMPOOL_CHANGED = 4;
+  EVENT_TYPE_TRANSACTION = 5;
+  EVENT_TYPE_UTXO = 6;
 }
 
 message SubscribeRequest {
@@ -43,18 +45,33 @@ message SubscribeRequestFilter {
 message SubscribeUpdate {
   uint32 schema_version = 1;
   bytes session_id = 2;
+  // Monotonically increasing for every gRPC update within one session.
   uint64 sequence = 3;
   google.protobuf.Timestamp observed_at = 4;
   EventType event_type = 5;
   // Names from SubscribeRequest.filters which matched this update.
   repeated string filters = 6;
+  // Sequence of the Zakura plugin event which produced this update. One block
+  // event can produce a block update and multiple transaction/UTXO updates.
+  uint64 source_sequence = 7;
 
   oneof update {
     BlockUpdate block = 10;
     BestChainUpdate best_chain = 11;
     MempoolUpdate mempool = 12;
     PongUpdate pong = 13;
+    TransactionUpdate transaction = 14;
+    UtxoUpdate utxo = 15;
   }
+}
+
+enum BlockCommitment {
+  BLOCK_COMMITMENT_UNSPECIFIED = 0;
+  // The block was validated and admitted to non-finalized state. It can still
+  // be on a side chain or be removed by a reorganization.
+  BLOCK_COMMITMENT_ACCEPTED = 1;
+  // The block became part of finalized canonical state.
+  BLOCK_COMMITMENT_FINALIZED = 2;
 }
 
 message BlockUpdate {
@@ -93,6 +110,58 @@ enum MempoolAction {
 message MempoolUpdate {
   MempoolAction action = 1;
   repeated string transaction_ids = 2;
+}
+
+message TransactionUpdate {
+  string transaction_id = 1;
+  // V5+ unmined IDs also commit to the authorizing data.
+  string unmined_transaction_id = 2;
+  optional string auth_digest = 3;
+  // Consensus-encoded Zcash transaction bytes.
+  bytes transaction = 4;
+  uint32 height = 5;
+  string block_hash = 6;
+  uint32 transaction_index = 7;
+  BlockCommitment commitment = 8;
+  bool coinbase = 9;
+}
+
+message Outpoint {
+  string transaction_id = 1;
+  uint32 output_index = 2;
+}
+
+message UtxoCreated {
+  Outpoint outpoint = 1;
+  uint64 value_zat = 2;
+  // Raw transparent scriptPubKey bytes without the CompactSize length prefix.
+  bytes lock_script = 3;
+}
+
+message UtxoSpent {
+  Outpoint outpoint = 1;
+  uint32 input_index = 2;
+  // Raw scriptSig bytes without the CompactSize length prefix.
+  bytes unlock_script = 3;
+  uint32 sequence = 4;
+}
+
+message UtxoChange {
+  oneof change {
+    UtxoCreated created = 1;
+    UtxoSpent spent = 2;
+  }
+}
+
+message UtxoUpdate {
+  uint32 height = 1;
+  string block_hash = 2;
+  string transaction_id = 3;
+  uint32 transaction_index = 4;
+  BlockCommitment commitment = 5;
+  // Changes are ordered with spends first, followed by created outputs. Input
+  // and output indexes preserve their order inside the transaction.
+  repeated UtxoChange changes = 6;
 }
 
 message PongUpdate {

@@ -46,6 +46,7 @@ pub struct GrpcPlugin {
     config: Config,
     subscriptions: EventSubscriptions,
     state: Arc<SharedState>,
+    next_sequence: u64,
     shutdown: Option<CancellationToken>,
     server: Option<JoinHandle<()>>,
 }
@@ -59,6 +60,7 @@ impl GrpcPlugin {
             config,
             subscriptions,
             state,
+            next_sequence: 0,
             shutdown: None,
             server: None,
         }
@@ -149,8 +151,24 @@ impl GeyserPlugin for GrpcPlugin {
     }
 
     fn on_event(&mut self, event: Arc<EventEnvelope>) -> PluginResult {
-        let update = event::encode_event(&event)?;
-        self.state.publish(update);
+        let updates = event::encode_event(
+            &event,
+            self.config.transaction_updates,
+            self.config.utxo_updates,
+        )?;
+        for mut update in updates {
+            self.next_sequence = self
+                .next_sequence
+                .checked_add(1)
+                .ok_or_else(|| PluginError::new("Zakura gRPC update sequence exhausted"))?;
+            update.sequence = self.next_sequence;
+            metrics::counter!(
+                "plugin.grpc.updates.total",
+                "event" => update.event_type.to_string()
+            )
+            .increment(1);
+            self.state.publish(update);
+        }
         metrics::counter!(
             "plugin.grpc.events.total",
             "event" => event.kind().as_str()

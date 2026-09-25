@@ -84,6 +84,8 @@ pub(crate) fn update_height(update: &SubscribeUpdate) -> Option<u32> {
     match update.update.as_ref()? {
         subscribe_update::Update::Block(block) => Some(block.height),
         subscribe_update::Update::BestChain(change) => Some(change.height),
+        subscribe_update::Update::Transaction(transaction) => Some(transaction.height),
+        subscribe_update::Update::Utxo(utxo) => Some(utxo.height),
         subscribe_update::Update::Mempool(_) | subscribe_update::Update::Pong(_) => None,
     }
 }

@@ -6,6 +6,10 @@ cargo run -p zakura-grpc-client-example -- replay-info
 cargo run -p zakura-grpc-client-example -- subscribe --from-height 0 --reconnect
 cargo run -p zakura-grpc-client-example -- subscribe \
   --event block-finalized --filter-name finalized --min-height 100
+cargo run -p zakura-grpc-client-example -- subscribe \
+  --event transaction --filter-name transactions --reconnect
+cargo run -p zakura-grpc-client-example -- subscribe \
+  --event utxo --filter-name utxos --reconnect
 ```
 
 The subscribe command keeps the request half of the bidirectional stream alive,

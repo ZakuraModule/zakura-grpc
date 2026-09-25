@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tonic::codec::CompressionEncoding;
 use zakura_grpc_client::{ReconnectConfig, ZakuraGrpcClient};
 use zakura_grpc_proto::geyser::{
-    subscribe_update, EventType, SubscribeRequest, SubscribeRequestFilter, SubscribeUpdate,
+    subscribe_update, utxo_change, BlockCommitment, EventType, Outpoint, SubscribeRequest,
+    SubscribeRequestFilter, SubscribeUpdate,
 };
 
 #[derive(Debug, Parser)]
@@ -72,6 +73,8 @@ enum EventArg {
     BestChainChanged,
     BlockFinalized,
     MempoolChanged,
+    Transaction,
+    Utxo,
 }
 
 impl From<EventArg> for EventType {
@@ -81,6 +84,8 @@ impl From<EventArg> for EventType {
             EventArg::BestChainChanged => Self::BestChainChanged,
             EventArg::BlockFinalized => Self::BlockFinalized,
             EventArg::MempoolChanged => Self::MempoolChanged,
+            EventArg::Transaction => Self::Transaction,
+            EventArg::Utxo => Self::Utxo,
         }
     }
 }
@@ -192,6 +197,55 @@ fn print_update(update: &SubscribeUpdate) {
             change.action,
             change.transaction_ids.len()
         ),
+        Some(subscribe_update::Update::Transaction(transaction)) => println!(
+            "sequence={} source_sequence={} event={} filters={:?} commitment={} height={} block={} transaction_index={} transaction_id={} unmined_transaction_id={} auth_digest={} transaction_bytes={} coinbase={}",
+            update.sequence,
+            update.source_sequence,
+            event_type,
+            update.filters,
+            commitment_name(transaction.commitment),
+            transaction.height,
+            transaction.block_hash,
+            transaction.transaction_index,
+            transaction.transaction_id,
+            transaction.unmined_transaction_id,
+            transaction.auth_digest.as_deref().unwrap_or("none"),
+            transaction.transaction.len(),
+            transaction.coinbase
+        ),
+        Some(subscribe_update::Update::Utxo(utxo)) => {
+            println!(
+                "sequence={} source_sequence={} event={} filters={:?} commitment={} height={} block={} transaction_index={} transaction_id={} changes={}",
+                update.sequence,
+                update.source_sequence,
+                event_type,
+                update.filters,
+                commitment_name(utxo.commitment),
+                utxo.height,
+                utxo.block_hash,
+                utxo.transaction_index,
+                utxo.transaction_id,
+                utxo.changes.len()
+            );
+            for change in &utxo.changes {
+                match change.change.as_ref() {
+                    Some(utxo_change::Change::Created(created)) => println!(
+                        "  created outpoint={} value_zat={} lock_script_bytes={}",
+                        format_outpoint(created.outpoint.as_ref()),
+                        created.value_zat,
+                        created.lock_script.len()
+                    ),
+                    Some(utxo_change::Change::Spent(spent)) => println!(
+                        "  spent outpoint={} input_index={} sequence={} unlock_script_bytes={}",
+                        format_outpoint(spent.outpoint.as_ref()),
+                        spent.input_index,
+                        spent.sequence,
+                        spent.unlock_script.len()
+                    ),
+                    None => println!("  utxo_change payload=none"),
+                }
+            }
+        }
         Some(subscribe_update::Update::Pong(pong)) => {
             println!("subscription_pong id={}", pong.id);
         }
@@ -200,4 +254,18 @@ fn print_update(update: &SubscribeUpdate) {
             update.sequence, event_type
         ),
     }
+}
+
+fn commitment_name(commitment: i32) -> String {
+    BlockCommitment::try_from(commitment).map_or_else(
+        |_| commitment.to_string(),
+        |commitment| commitment.as_str_name().to_owned(),
+    )
+}
+
+fn format_outpoint(outpoint: Option<&Outpoint>) -> String {
+    outpoint.map_or_else(
+        || "missing".to_owned(),
+        |outpoint| format!("{}:{}", outpoint.transaction_id, outpoint.output_index),
+    )
 }

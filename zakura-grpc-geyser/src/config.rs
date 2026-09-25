@@ -13,6 +13,10 @@ use tonic::{codec::CompressionEncoding, metadata::AsciiMetadataValue};
 pub struct Config {
     /// Address used by the gRPC server.
     pub listen_addr: SocketAddr,
+    /// Emit one transaction update for every transaction in a block event.
+    pub transaction_updates: bool,
+    /// Emit transparent UTXO changes derived from every transaction in a block event.
+    pub utxo_updates: bool,
     /// Number of distinct block heights retained for short reconnect replay.
     pub replay_stored_blocks: usize,
     /// Capacity of the live event broadcast ring.
@@ -78,6 +82,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10_000),
+            transaction_updates: true,
+            utxo_updates: true,
             replay_stored_blocks: 150,
             broadcast_capacity: 100_000,
             client_channel_capacity: 10_000,
@@ -169,7 +175,7 @@ impl Default for FilterLimits {
     fn default() -> Self {
         Self {
             max_named_filters: 32,
-            max_event_types: 4,
+            max_event_types: 6,
             max_name_bytes: 128,
             allow_all: true,
         }
