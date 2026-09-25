@@ -8,6 +8,7 @@ use thiserror::Error;
 use tonic::{codec::CompressionEncoding, metadata::AsciiMetadataValue};
 
 /// Configuration owned by one Zakura gRPC plugin instance.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
@@ -15,6 +16,8 @@ pub struct Config {
     pub listen_addr: SocketAddr,
     /// Emit one transaction update for every transaction in a block event.
     pub transaction_updates: bool,
+    /// Emit complete verified transactions when they enter the mempool.
+    pub mempool_transaction_updates: bool,
     /// Emit transparent UTXO changes derived from every transaction in a block event.
     pub utxo_updates: bool,
     /// Number of distinct block heights retained for short reconnect replay.
@@ -43,9 +46,9 @@ pub struct Config {
     pub subscription_limit_enforce: bool,
     /// Limits applied whenever a client installs a subscription filter.
     pub filter_limits: FilterLimits,
-    /// Number of dedicated threads used to encode transactions inside one block event.
+    /// Number of dedicated threads used to encode block and mempool transaction batches.
     pub event_encoding_threads: usize,
-    /// Minimum transaction count required before parallel event encoding is used.
+    /// Minimum transaction count required before parallel batch encoding is used.
     pub parallel_encoding_min_transactions: usize,
     /// Enable Tonic's adaptive HTTP/2 flow-control window.
     pub server_http2_adaptive_window: Option<bool>,
@@ -108,6 +111,7 @@ impl Default for Config {
         Self {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10_000),
             transaction_updates: true,
+            mempool_transaction_updates: true,
             utxo_updates: true,
             replay_stored_blocks: 150,
             replay_max_events: 250_000,
@@ -215,7 +219,7 @@ impl Default for FilterLimits {
     fn default() -> Self {
         Self {
             max_named_filters: 32,
-            max_event_types: 6,
+            max_event_types: 7,
             max_name_bytes: 128,
             max_transaction_ids: 256,
             max_transparent_addresses: 256,

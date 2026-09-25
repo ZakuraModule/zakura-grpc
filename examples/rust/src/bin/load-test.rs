@@ -58,6 +58,7 @@ enum EventArg {
     BestChainChanged,
     BlockFinalized,
     MempoolChanged,
+    MempoolTransaction,
     Transaction,
     Utxo,
 }
@@ -69,6 +70,7 @@ impl From<EventArg> for EventType {
             EventArg::BestChainChanged => Self::BestChainChanged,
             EventArg::BlockFinalized => Self::BlockFinalized,
             EventArg::MempoolChanged => Self::MempoolChanged,
+            EventArg::MempoolTransaction => Self::MempoolTransaction,
             EventArg::Transaction => Self::Transaction,
             EventArg::Utxo => Self::Utxo,
         }

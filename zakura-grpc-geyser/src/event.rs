@@ -14,20 +14,22 @@ use zakura_chain::{
     transparent,
 };
 use zakura_geyser_plugin_interface::{
-    BestChainChange, BlockEvent, EventEnvelope, MempoolEventKind, PluginError, PluginEvent,
+    BestChainChange, BlockEvent, EventEnvelope, MempoolEvent, MempoolEventKind, PluginError,
+    PluginEvent,
 };
 use zakura_grpc_proto::geyser::{
     best_chain_update, subscribe_update, transparent_input, utxo_change, BestChainGrow,
     BestChainReset, BestChainUpdate, BlockCommitment, BlockUpdate, EventType, MempoolAction,
-    MempoolUpdate, Outpoint, SubscribeUpdate, TransactionUpdate, TransparentCoinbaseInput,
-    TransparentInput, TransparentOutput, TransparentPrevoutInput, UtxoChange, UtxoCreated,
-    UtxoSpent, UtxoUpdate,
+    MempoolTransactionUpdate, MempoolUpdate, Outpoint, SubscribeUpdate, TransactionUpdate,
+    TransparentCoinbaseInput, TransparentInput, TransparentOutput, TransparentPrevoutInput,
+    UtxoChange, UtxoCreated, UtxoSpent, UtxoUpdate,
 };
 
 pub(crate) fn encode_event(
     event: &EventEnvelope,
     transaction_updates: bool,
     utxo_updates: bool,
+    mempool_transaction_updates: bool,
     encoding_pool: Option<&ThreadPool>,
     parallel_encoding_min_transactions: usize,
 ) -> Result<Vec<SubscribeUpdate>, PluginError> {
@@ -62,7 +64,12 @@ pub(crate) fn encode_event(
                     transaction_ids: change
                         .transaction_ids
                         .iter()
-                        .map(ToString::to_string)
+                        .map(|transaction_id| {
+                            encode_unmined_transaction_id(
+                                transaction_id.mined_id(),
+                                transaction_id.auth_digest(),
+                            )
+                        })
                         .collect(),
                 }),
             )]
@@ -94,10 +101,121 @@ pub(crate) fn encode_event(
                 parallel_encoding_min_transactions,
             },
         )?,
-        PluginEvent::BestChainChanged(_) | PluginEvent::MempoolChanged(_) => {}
+        PluginEvent::MempoolChanged(change) => append_mempool_transaction_updates(
+            &mut updates,
+            &metadata,
+            change,
+            mempool_transaction_updates,
+            encoding_pool,
+            parallel_encoding_min_transactions,
+        )?,
+        PluginEvent::BestChainChanged(_) => {}
     }
 
     Ok(updates)
+}
+
+fn append_mempool_transaction_updates(
+    updates: &mut Vec<SubscribeUpdate>,
+    metadata: &UpdateMetadata,
+    change: &MempoolEvent,
+    enabled: bool,
+    encoding_pool: Option<&ThreadPool>,
+    parallel_encoding_min_transactions: usize,
+) -> Result<(), PluginError> {
+    if !enabled || change.kind != MempoolEventKind::Added || change.transactions.is_empty() {
+        return Ok(());
+    }
+
+    let encode = |transaction: &transaction::VerifiedUnminedTx| {
+        encode_mempool_transaction_update(metadata, change, transaction)
+    };
+    let encoded = if let Some(pool) =
+        encoding_pool.filter(|_| change.transactions.len() >= parallel_encoding_min_transactions)
+    {
+        metrics::counter!("plugin.grpc.encoding.mempool_batches.total", "mode" => "parallel")
+            .increment(1);
+        pool.install(|| {
+            change
+                .transactions
+                .par_iter()
+                .map(encode)
+                .collect::<Result<Vec<_>, PluginError>>()
+        })?
+    } else {
+        metrics::counter!("plugin.grpc.encoding.mempool_batches.total", "mode" => "sequential")
+            .increment(1);
+        change
+            .transactions
+            .iter()
+            .map(encode)
+            .collect::<Result<Vec<_>, PluginError>>()?
+    };
+    updates.extend(encoded);
+
+    Ok(())
+}
+
+fn encode_mempool_transaction_update(
+    metadata: &UpdateMetadata,
+    change: &MempoolEvent,
+    verified: &transaction::VerifiedUnminedTx,
+) -> Result<SubscribeUpdate, PluginError> {
+    let transaction = verified.transaction.transaction().as_ref();
+    let (transaction_id, auth_digest) = transaction.txid_and_auth_digest();
+    let transaction_id_string = transaction_id.to_string();
+    let EncodedTransparentUpdates {
+        transaction_inputs,
+        transaction_outputs,
+        transparent_input_value_zat,
+        transparent_output_value_zat,
+        ..
+    } = encode_transparent_updates(
+        transaction,
+        &transaction_id_string,
+        &change.network,
+        PreviousOutputs::Mempool(&verified.spent_outputs),
+        true,
+        false,
+    )?;
+    let transaction_bytes = transaction
+        .zcash_serialize_to_vec()
+        .map_err(|error| PluginError::new(format!("failed to encode transaction: {error}")))?;
+    let miner_fee_zat = u64::try_from(verified.miner_fee.zatoshis())
+        .expect("verified mempool transaction fees are non-negative by type");
+    let admitted_at = verified.time.as_ref().map(|time| Timestamp {
+        seconds: time.timestamp(),
+        nanos: i32::try_from(time.timestamp_subsec_nanos())
+            .expect("nanoseconds fit in i32 because they are always below one billion"),
+    });
+
+    Ok(new_update(
+        metadata,
+        EventType::MempoolTransaction,
+        subscribe_update::Update::MempoolTransaction(MempoolTransactionUpdate {
+            transaction_id: transaction_id_string,
+            unmined_transaction_id: encode_unmined_transaction_id(transaction_id, auth_digest),
+            auth_digest: auth_digest.map(|digest| digest.to_string()),
+            transaction: transaction_bytes.into(),
+            network: change.network.to_string(),
+            transparent_inputs: transaction_inputs,
+            transparent_outputs: transaction_outputs,
+            version: transaction.version(),
+            lock_time: transaction.raw_lock_time(),
+            lock_time_is_time: transaction.lock_time_is_time(),
+            expiry_height: transaction.expiry_height().map(|height| height.0),
+            transparent_input_value_zat,
+            transparent_output_value_zat,
+            miner_fee_zat,
+            admitted_at,
+            admitted_height: verified.height.map(|height| height.0),
+            conventional_actions: verified.conventional_actions,
+            unpaid_actions: verified.unpaid_actions,
+            legacy_sigop_count: verified.legacy_sigop_count,
+            p2sh_sigop_count: verified.p2sh_sigop_count,
+            fee_weight_ratio: verified.fee_weight_ratio,
+        }),
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -189,7 +307,7 @@ fn encode_transaction_updates(
         transaction,
         &transaction_id_string,
         &block.network,
-        &block.spent_outputs,
+        PreviousOutputs::Block(&block.spent_outputs),
         transaction_updates,
         utxo_updates,
     )?;
@@ -255,9 +373,15 @@ struct EncodedTransparentUpdates {
 
 struct TransparentEncodingContext<'a> {
     network: &'a Network,
-    spent_outputs: &'a HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    previous_outputs: PreviousOutputs<'a>,
     transaction_updates: bool,
     utxo_updates: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PreviousOutputs<'a> {
+    Block(&'a HashMap<transparent::OutPoint, transparent::OrderedUtxo>),
+    Mempool(&'a [transparent::Output]),
 }
 
 #[derive(Clone, Default)]
@@ -273,13 +397,13 @@ fn encode_transparent_updates(
     transaction: &Transaction,
     transaction_id_string: &str,
     network: &Network,
-    spent_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    previous_outputs: PreviousOutputs<'_>,
     transaction_updates: bool,
     utxo_updates: bool,
 ) -> Result<EncodedTransparentUpdates, PluginError> {
     let context = TransparentEncodingContext {
         network,
-        spent_outputs,
+        previous_outputs,
         transaction_updates,
         utxo_updates,
     };
@@ -307,12 +431,13 @@ fn encode_transparent_updates(
     let mut transparent_output_value_zat = 0u64;
 
     for (input_index, input) in transaction.inputs().iter().enumerate() {
-        let input_index = u32::try_from(input_index)
+        let grpc_input_index = u32::try_from(input_index)
             .map_err(|_| PluginError::new("input index exceeds the gRPC protocol's u32 range"))?;
         let input_value_zat = encode_transparent_input(
             &context,
             input,
             input_index,
+            grpc_input_index,
             &mut transaction_inputs,
             &mut utxo_changes,
         );
@@ -354,7 +479,8 @@ fn encode_transparent_updates(
 fn encode_transparent_input(
     context: &TransparentEncodingContext<'_>,
     input: &transparent::Input,
-    input_index: u32,
+    input_index: usize,
+    grpc_input_index: u32,
     transaction_inputs: &mut Vec<TransparentInput>,
     utxo_changes: &mut Vec<UtxoChange>,
 ) -> Option<u64> {
@@ -364,7 +490,7 @@ fn encode_transparent_input(
             unlock_script,
             sequence,
         } => {
-            let previous = encode_previous_output(context, outpoint);
+            let previous = encode_previous_output(context, outpoint, input_index);
             let grpc_outpoint = Outpoint {
                 transaction_id: outpoint.hash.to_string(),
                 output_index: outpoint.index,
@@ -373,7 +499,7 @@ fn encode_transparent_input(
 
             if context.transaction_updates {
                 transaction_inputs.push(TransparentInput {
-                    input_index,
+                    input_index: grpc_input_index,
                     sequence: *sequence,
                     input: Some(transparent_input::Input::Prevout(TransparentPrevoutInput {
                         previous_output: Some(grpc_outpoint.clone()),
@@ -390,7 +516,7 @@ fn encode_transparent_input(
                 utxo_changes.push(UtxoChange {
                     change: Some(utxo_change::Change::Spent(UtxoSpent {
                         outpoint: Some(grpc_outpoint),
-                        input_index,
+                        input_index: grpc_input_index,
                         unlock_script,
                         sequence: *sequence,
                         previous_value_zat: previous.value_zat,
@@ -410,7 +536,7 @@ fn encode_transparent_input(
         } => {
             if context.transaction_updates {
                 transaction_inputs.push(TransparentInput {
-                    input_index,
+                    input_index: grpc_input_index,
                     sequence: *sequence,
                     input: Some(transparent_input::Input::Coinbase(
                         TransparentCoinbaseInput {
@@ -467,11 +593,27 @@ fn encode_transparent_output(
 fn encode_previous_output(
     context: &TransparentEncodingContext<'_>,
     outpoint: &transparent::OutPoint,
+    input_index: usize,
 ) -> EncodedPreviousOutput {
-    let Some(previous) = context.spent_outputs.get(outpoint) else {
-        return EncodedPreviousOutput::default();
+    let (output, height, from_coinbase) = match context.previous_outputs {
+        PreviousOutputs::Block(previous_outputs) => {
+            let Some(previous) = previous_outputs.get(outpoint) else {
+                return EncodedPreviousOutput::default();
+            };
+            (
+                &previous.utxo.output,
+                Some(previous.utxo.height.0),
+                Some(previous.utxo.from_coinbase),
+            )
+        }
+        PreviousOutputs::Mempool(previous_outputs) => {
+            let Some(previous) = previous_outputs.get(input_index) else {
+                return EncodedPreviousOutput::default();
+            };
+            (previous, None, None)
+        }
     };
-    let output = &previous.utxo.output;
+
     EncodedPreviousOutput {
         value_zat: Some(
             u64::try_from(output.value.zatoshis())
@@ -481,8 +623,8 @@ fn encode_previous_output(
         address: output
             .address(context.network)
             .map(|address| address.to_string()),
-        height: Some(previous.utxo.height.0),
-        from_coinbase: Some(previous.utxo.from_coinbase),
+        height,
+        from_coinbase,
     }
 }
 
@@ -585,17 +727,24 @@ pub(crate) fn block_height(update: &SubscribeUpdate) -> Option<u32> {
         subscribe_update::Update::BestChain(change) => Some(change.height),
         subscribe_update::Update::Transaction(transaction) => Some(transaction.height),
         subscribe_update::Update::Utxo(utxo) => Some(utxo.height),
-        subscribe_update::Update::Mempool(_) | subscribe_update::Update::Pong(_) => None,
+        subscribe_update::Update::Mempool(_)
+        | subscribe_update::Update::MempoolTransaction(_)
+        | subscribe_update::Update::Pong(_) => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use zakura_chain::{
         amount::{Amount, NonNegative},
         block::Height,
-        transaction::LockTime,
+        transaction::{LockTime, VerifiedUnminedTx},
         transparent::{Address, Input, OrderedUtxo, OutPoint, Output, Script},
+    };
+    use zakura_geyser_plugin_interface::{
+        EventEnvelope, MempoolEvent, MempoolEventKind, PluginEvent, SessionId, EVENT_SCHEMA_VERSION,
     };
 
     use super::*;
@@ -647,7 +796,7 @@ mod tests {
             &transaction,
             &transaction_id.to_string(),
             &network,
-            &spent_outputs,
+            PreviousOutputs::Block(&spent_outputs),
             true,
             true,
         )
@@ -721,7 +870,7 @@ mod tests {
             &transaction,
             &transaction.hash().to_string(),
             &Network::Mainnet,
-            &HashMap::new(),
+            PreviousOutputs::Block(&HashMap::new()),
             true,
             true,
         )
@@ -739,5 +888,87 @@ mod tests {
         };
         assert_eq!(coinbase.height, 99);
         assert_eq!(coinbase.data.as_ref(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn encodes_full_mempool_transaction_with_previous_output_context() {
+        let network = Network::Mainnet;
+        let previous = OutPoint {
+            hash: transaction::Hash([3; 32]),
+            index: 1,
+        };
+        let previous_address = Address::from_pub_key_hash(network.t_addr_kind(), [4; 20]);
+        let output_address = Address::from_pub_key_hash(network.t_addr_kind(), [5; 20]);
+        let previous_output = Output::new(
+            Amount::<NonNegative>::new(10_123),
+            previous_address.script(),
+        );
+        let transaction = Transaction::V1 {
+            inputs: vec![Input::PrevOut {
+                outpoint: previous,
+                unlock_script: Script::new(&[0x51]),
+                sequence: 9,
+            }],
+            outputs: vec![Output::new(
+                Amount::<NonNegative>::new(123),
+                output_address.script(),
+            )],
+            lock_time: LockTime::unlocked(),
+        };
+        let mut verified = VerifiedUnminedTx::new(
+            transaction.into(),
+            Amount::<NonNegative>::new(10_000),
+            2,
+            3,
+            Arc::new(vec![previous_output]),
+        )
+        .unwrap();
+        verified.height = Some(Height(55));
+        let transaction_id = verified.transaction.id();
+        let event = EventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            session_id: SessionId(7),
+            sequence: 11,
+            observed_at: SystemTime::UNIX_EPOCH,
+            payload: PluginEvent::MempoolChanged(MempoolEvent::new(
+                network,
+                MempoolEventKind::Added,
+                vec![transaction_id].into(),
+                vec![verified].into(),
+            )),
+        };
+
+        let summary_only = encode_event(&event, true, true, false, None, 32).unwrap();
+        assert_eq!(summary_only.len(), 1);
+        assert_eq!(summary_only[0].event_type, EventType::MempoolChanged as i32);
+
+        let updates = encode_event(&event, true, true, true, None, 32).unwrap();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].event_type, EventType::MempoolChanged as i32);
+        let Some(subscribe_update::Update::MempoolTransaction(transaction)) =
+            updates[1].update.as_ref()
+        else {
+            panic!("added mempool transactions must include their full payload");
+        };
+        assert_eq!(updates[1].event_type, EventType::MempoolTransaction as i32);
+        assert_eq!(transaction.miner_fee_zat, 10_000);
+        assert_eq!(transaction.admitted_height, Some(55));
+        assert_eq!(transaction.transparent_input_value_zat, Some(10_123));
+        assert_eq!(transaction.transparent_output_value_zat, 123);
+        assert_eq!(transaction.legacy_sigop_count, 2);
+        assert_eq!(transaction.p2sh_sigop_count, 3);
+
+        let Some(transparent_input::Input::Prevout(input)) =
+            transaction.transparent_inputs[0].input.as_ref()
+        else {
+            panic!("the mempool input must retain its previous output");
+        };
+        assert_eq!(input.previous_value_zat, Some(10_123));
+        assert_eq!(
+            input.previous_address.as_deref(),
+            Some(previous_address.to_string().as_str())
+        );
+        assert_eq!(input.previous_height, None);
+        assert_eq!(input.previous_from_coinbase, None);
     }
 }

@@ -176,6 +176,7 @@ impl GeyserPlugin for GrpcPlugin {
             &event,
             self.config.transaction_updates,
             self.config.utxo_updates,
+            self.config.mempool_transaction_updates,
             self.encoding_pool.as_ref(),
             self.config.parallel_encoding_min_transactions,
         );

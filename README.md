@@ -24,6 +24,8 @@ accounts, and transaction notifications:
 - gzip/zstd, gRPC health, HTTP/2 flow-control and keepalive configuration;
 - per-transaction raw consensus payloads, decoded transparent inputs/outputs,
   and transparent UTXO create/spend updates;
+- full verified mempool transactions with fees, admission metadata, and resolved
+  transparent previous outputs;
 - a Rust client builder with TLS, transport tuning, automatic reconnect,
   checkpoint replay, and client-side duplicate suppression.
 
@@ -66,6 +68,7 @@ overflow = "disable_plugin"
 [geyser.plugins.plugin]
 listen_addr = "127.0.0.1:10000"
 transaction_updates = true
+mempool_transaction_updates = true
 utxo_updates = true
 replay_stored_blocks = 150
 replay_max_events = 250000
@@ -79,7 +82,7 @@ compression = { accept = ["gzip", "zstd"], send = ["gzip", "zstd"] }
 # x_token = "replace-me"
 subscription_limit = 1000
 subscription_limit_enforce = false
-filter_limits = { max_named_filters = 32, max_event_types = 6, max_name_bytes = 128, max_transaction_ids = 256, max_transparent_addresses = 256, allow_all = true }
+filter_limits = { max_named_filters = 32, max_event_types = 7, max_name_bytes = 128, max_transaction_ids = 256, max_transparent_addresses = 256, allow_all = true }
 event_encoding_threads = 1
 parallel_encoding_min_transactions = 32
 server_http2_adaptive_window = true
@@ -98,7 +101,8 @@ Replay is retained in source-event buckets and is bounded simultaneously by
 distinct height count, protobuf update count, encoded protobuf bytes, and age.
 Setting `replay_stored_blocks = 0` disables replay. Set
 `event_encoding_threads` above one to enable ordered parallel transaction
-encoding for blocks containing at least `parallel_encoding_min_transactions`.
+encoding for block or mempool batches containing at least
+`parallel_encoding_min_transactions` transactions.
 
 ## Example client
 
@@ -132,6 +136,22 @@ cargo run -p zakura-grpc-client-example -- \
   --endpoint http://127.0.0.1:10000 subscribe \
   --event transaction --filter-name transactions --reconnect
 ```
+
+Stream complete transactions as soon as they enter this node's verified
+mempool (before they are mined):
+
+```sh
+cargo run -p zakura-grpc-client-example -- \
+  --endpoint http://127.0.0.1:10000 subscribe \
+  --event mempool-transaction --filter-name mempool-transactions --reconnect
+```
+
+Each mempool transaction includes raw consensus bytes, txid/unmined ID,
+transparent inputs and outputs, resolved previous value/address/script, miner
+fee, admission time/height, ZIP-317 action counts, and sigop counts. These are
+live ephemeral updates: `from_height` replay only applies to block-scoped
+events. Use `mempool-changed` alongside this stream to observe later `MINED` or
+`INVALIDATED` lifecycle transitions by ID.
 
 Filter transaction updates for one wallet address without sending unrelated
 transactions to the client:
@@ -227,6 +247,8 @@ height has been evicted, the server returns `OUT_OF_RANGE`; clients can query
 - The replay window has independent height, event, byte, and age limits.
 - Lagging clients are disconnected and can reconnect using `from_height`.
 - Replay data disappears when the node restarts.
+- Full mempool transaction updates are live-only and are never inserted into
+  the block-height replay window.
 - The reconnecting Rust client resumes from a height checkpoint and suppresses
   replay duplicates with `(session_id, sequence)`.
 - Full block payloads contain consensus-encoded Zcash block bytes.

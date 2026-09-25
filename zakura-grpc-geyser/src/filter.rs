@@ -204,6 +204,9 @@ fn update_matches_transaction_id(
         Some(subscribe_update::Update::Transaction(transaction)) => {
             transaction_ids.contains(&transaction.transaction_id)
         }
+        Some(subscribe_update::Update::MempoolTransaction(transaction)) => {
+            transaction_ids.contains(&transaction.transaction_id)
+        }
         Some(subscribe_update::Update::Utxo(utxo)) => {
             transaction_ids.contains(&utxo.transaction_id)
         }
@@ -235,6 +238,22 @@ fn update_matches_transparent_address(
 ) -> bool {
     match update.update.as_ref() {
         Some(subscribe_update::Update::Transaction(transaction)) => transaction
+            .transparent_inputs
+            .iter()
+            .filter_map(|input| match input.input.as_ref() {
+                Some(transparent_input::Input::Prevout(previous)) => {
+                    previous.previous_address.as_ref()
+                }
+                Some(transparent_input::Input::Coinbase(_)) | None => None,
+            })
+            .chain(
+                transaction
+                    .transparent_outputs
+                    .iter()
+                    .filter_map(|output| output.address.as_ref()),
+            )
+            .any(|address| transparent_addresses.contains(address)),
+        Some(subscribe_update::Update::MempoolTransaction(transaction)) => transaction
             .transparent_inputs
             .iter()
             .filter_map(|input| match input.input.as_ref() {
@@ -293,7 +312,8 @@ mod tests {
 
     use zakura_chain::parameters::Network;
     use zakura_grpc_proto::geyser::{
-        subscribe_update, BlockUpdate, TransactionUpdate, TransparentOutput,
+        subscribe_update, BlockUpdate, MempoolTransactionUpdate, TransactionUpdate,
+        TransparentOutput,
     };
 
     use super::*;
@@ -320,6 +340,23 @@ mod tests {
                 }],
                 ..TransactionUpdate::default()
             })),
+            ..SubscribeUpdate::default()
+        }
+    }
+
+    fn mempool_transaction_update(transaction_id: String, address: String) -> SubscribeUpdate {
+        SubscribeUpdate {
+            event_type: EventType::MempoolTransaction.into(),
+            update: Some(subscribe_update::Update::MempoolTransaction(
+                MempoolTransactionUpdate {
+                    transaction_id,
+                    transparent_outputs: vec![TransparentOutput {
+                        address: Some(address),
+                        ..TransparentOutput::default()
+                    }],
+                    ..MempoolTransactionUpdate::default()
+                },
+            )),
             ..SubscribeUpdate::default()
         }
     }
@@ -413,6 +450,36 @@ mod tests {
         assert_eq!(
             filter.matched_names(&transaction_update(transaction_id, address.to_string())),
             Some(vec!["wallet".to_owned()])
+        );
+    }
+
+    #[test]
+    fn named_filter_matches_mempool_transaction_id_and_address() {
+        let transaction_id = transaction::Hash([8; 32]).to_string();
+        let address = Address::from_pub_key_hash(Network::Mainnet.t_addr_kind(), [10; 20]);
+        let filter = EventFilter::new(
+            &SubscribeRequest {
+                filters: HashMap::from([(
+                    "mempool-wallet".to_owned(),
+                    SubscribeRequestFilter {
+                        event_types: vec![EventType::MempoolTransaction.into()],
+                        transaction_ids: vec![transaction_id.clone()],
+                        transparent_addresses: vec![address.to_string()],
+                        ..SubscribeRequestFilter::default()
+                    },
+                )]),
+                ..SubscribeRequest::default()
+            },
+            &FilterLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            filter.matched_names(&mempool_transaction_update(
+                transaction_id,
+                address.to_string()
+            )),
+            Some(vec!["mempool-wallet".to_owned()])
         );
     }
 }

@@ -19,6 +19,7 @@ enum EventType {
   EVENT_TYPE_MEMPOOL_CHANGED = 4;
   EVENT_TYPE_TRANSACTION = 5;
   EVENT_TYPE_UTXO = 6;
+  EVENT_TYPE_MEMPOOL_TRANSACTION = 7;
 }
 
 message SubscribeRequest {
@@ -67,6 +68,7 @@ message SubscribeUpdate {
     PongUpdate pong = 13;
     TransactionUpdate transaction = 14;
     UtxoUpdate utxo = 15;
+    MempoolTransactionUpdate mempool_transaction = 16;
   }
 }
 
@@ -142,6 +144,33 @@ message TransactionUpdate {
   // Present when verified context resolved every previous transparent output.
   optional uint64 transparent_input_value_zat = 17;
   uint64 transparent_output_value_zat = 18;
+}
+
+message MempoolTransactionUpdate {
+  string transaction_id = 1;
+  // V5+ unmined IDs also commit to the authorizing data.
+  string unmined_transaction_id = 2;
+  optional string auth_digest = 3;
+  // Consensus-encoded Zcash transaction bytes.
+  bytes transaction = 4;
+  string network = 5;
+  repeated TransparentInput transparent_inputs = 6;
+  repeated TransparentOutput transparent_outputs = 7;
+  uint32 version = 8;
+  uint32 lock_time = 9;
+  bool lock_time_is_time = 10;
+  optional uint32 expiry_height = 11;
+  // Present when verification resolved every previous transparent output.
+  optional uint64 transparent_input_value_zat = 12;
+  uint64 transparent_output_value_zat = 13;
+  uint64 miner_fee_zat = 14;
+  optional google.protobuf.Timestamp admitted_at = 15;
+  optional uint32 admitted_height = 16;
+  uint32 conventional_actions = 17;
+  uint32 unpaid_actions = 18;
+  uint32 legacy_sigop_count = 19;
+  uint32 p2sh_sigop_count = 20;
+  float fee_weight_ratio = 21;
 }
 
 message TransparentInput {

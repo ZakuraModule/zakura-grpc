@@ -4,8 +4,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tonic::codec::CompressionEncoding;
 use zakura_grpc_client::{ReconnectConfig, ZakuraGrpcClient};
 use zakura_grpc_proto::geyser::{
-    subscribe_update, transparent_input, utxo_change, BlockCommitment, EventType, Outpoint,
-    SubscribeRequest, SubscribeRequestFilter, SubscribeUpdate, TransactionUpdate,
+    subscribe_update, transparent_input, utxo_change, BlockCommitment, EventType,
+    MempoolTransactionUpdate, Outpoint, SubscribeRequest, SubscribeRequestFilter, SubscribeUpdate,
+    TransactionUpdate, TransparentInput, TransparentOutput,
 };
 
 #[derive(Debug, Parser)]
@@ -79,6 +80,7 @@ enum EventArg {
     BestChainChanged,
     BlockFinalized,
     MempoolChanged,
+    MempoolTransaction,
     Transaction,
     Utxo,
 }
@@ -90,6 +92,7 @@ impl From<EventArg> for EventType {
             EventArg::BestChainChanged => Self::BestChainChanged,
             EventArg::BlockFinalized => Self::BlockFinalized,
             EventArg::MempoolChanged => Self::MempoolChanged,
+            EventArg::MempoolTransaction => Self::MempoolTransaction,
             EventArg::Transaction => Self::Transaction,
             EventArg::Utxo => Self::Utxo,
         }
@@ -210,6 +213,9 @@ fn print_update(update: &SubscribeUpdate) {
         Some(subscribe_update::Update::Transaction(transaction)) => {
             print_transaction_update(update, &event_type, transaction);
         }
+        Some(subscribe_update::Update::MempoolTransaction(transaction)) => {
+            print_mempool_transaction_update(update, &event_type, transaction);
+        }
         Some(subscribe_update::Update::Utxo(utxo)) => {
             println!(
                 "sequence={} source_sequence={} event={} filters={:?} commitment={} height={} block={} transaction_index={} transaction_id={} changes={}",
@@ -288,7 +294,53 @@ fn print_transaction_update(
         transaction.transparent_input_value_zat,
         transaction.transparent_output_value_zat
     );
-    for input in &transaction.transparent_inputs {
+    print_transparent_details(
+        &transaction.transparent_inputs,
+        &transaction.transparent_outputs,
+    );
+}
+
+fn print_mempool_transaction_update(
+    update: &SubscribeUpdate,
+    event_type: &str,
+    transaction: &MempoolTransactionUpdate,
+) {
+    println!(
+        "sequence={} source_sequence={} event={} filters={:?} network={} transaction_id={} unmined_transaction_id={} auth_digest={} version={} lock_time={} lock_time_is_time={} expiry_height={:?} transaction_bytes={} transparent_inputs={} transparent_outputs={} transparent_input_value_zat={:?} transparent_output_value_zat={} miner_fee_zat={} admitted_at={:?} admitted_height={:?} conventional_actions={} unpaid_actions={} legacy_sigop_count={} p2sh_sigop_count={} fee_weight_ratio={}",
+        update.sequence,
+        update.source_sequence,
+        event_type,
+        update.filters,
+        transaction.network,
+        transaction.transaction_id,
+        transaction.unmined_transaction_id,
+        transaction.auth_digest.as_deref().unwrap_or("none"),
+        transaction.version,
+        transaction.lock_time,
+        transaction.lock_time_is_time,
+        transaction.expiry_height,
+        transaction.transaction.len(),
+        transaction.transparent_inputs.len(),
+        transaction.transparent_outputs.len(),
+        transaction.transparent_input_value_zat,
+        transaction.transparent_output_value_zat,
+        transaction.miner_fee_zat,
+        transaction.admitted_at,
+        transaction.admitted_height,
+        transaction.conventional_actions,
+        transaction.unpaid_actions,
+        transaction.legacy_sigop_count,
+        transaction.p2sh_sigop_count,
+        transaction.fee_weight_ratio,
+    );
+    print_transparent_details(
+        &transaction.transparent_inputs,
+        &transaction.transparent_outputs,
+    );
+}
+
+fn print_transparent_details(inputs: &[TransparentInput], outputs: &[TransparentOutput]) {
+    for input in inputs {
         match input.input.as_ref() {
             Some(transparent_input::Input::Prevout(prevout)) => println!(
                 "  input index={} prevout={} sequence={} unlock_script_bytes={} previous_value_zat={:?} previous_address={} previous_height={:?} previous_from_coinbase={:?}",
@@ -311,7 +363,7 @@ fn print_transaction_update(
             None => println!("  input index={} payload=none", input.input_index),
         }
     }
-    for output in &transaction.transparent_outputs {
+    for output in outputs {
         println!(
             "  output index={} value_zat={} address={} lock_script_bytes={}",
             output.output_index,
