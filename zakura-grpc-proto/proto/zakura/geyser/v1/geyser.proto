@@ -124,6 +124,39 @@ message TransactionUpdate {
   uint32 transaction_index = 7;
   BlockCommitment commitment = 8;
   bool coinbase = 9;
+  // Decoded transparent inputs in consensus order. Shielded transaction data
+  // remains available in the consensus-encoded transaction field.
+  repeated TransparentInput transparent_inputs = 10;
+  // Decoded transparent outputs in consensus order.
+  repeated TransparentOutput transparent_outputs = 11;
+}
+
+message TransparentInput {
+  uint32 input_index = 1;
+  uint32 sequence = 2;
+
+  oneof input {
+    TransparentPrevoutInput prevout = 10;
+    TransparentCoinbaseInput coinbase = 11;
+  }
+}
+
+message TransparentPrevoutInput {
+  Outpoint previous_output = 1;
+  // Raw scriptSig bytes without the CompactSize length prefix.
+  bytes unlock_script = 2;
+}
+
+message TransparentCoinbaseInput {
+  uint32 height = 1;
+  bytes data = 2;
+}
+
+message TransparentOutput {
+  uint32 output_index = 1;
+  uint64 value_zat = 2;
+  // Raw scriptPubKey bytes without the CompactSize length prefix.
+  bytes lock_script = 3;
 }
 
 message Outpoint {

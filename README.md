@@ -22,7 +22,8 @@ accounts, and transaction notifications:
 - bounded live/replay/client queues and lagging-client disconnects;
 - optional `x-token` authentication and per-subscriber concurrent stream limits;
 - gzip/zstd, gRPC health, HTTP/2 flow-control and keepalive configuration;
-- per-transaction raw consensus payloads and transparent UTXO create/spend updates;
+- per-transaction raw consensus payloads, decoded transparent inputs/outputs,
+  and transparent UTXO create/spend updates;
 - a Rust client builder with TLS, transport tuning, automatic reconnect,
   checkpoint replay, and client-side duplicate suppression.
 
@@ -176,9 +177,14 @@ height has been evicted, the server returns `OUT_OF_RANGE`; clients can query
   replay duplicates with `(session_id, sequence)`.
 - Full block payloads contain consensus-encoded Zcash block bytes.
 - Transaction payloads contain consensus-encoded transaction bytes, txid,
-  unmined ID, optional ZIP-244 auth digest, block position, and commitment.
+  unmined ID, optional ZIP-244 auth digest, block position, commitment, and
+  decoded transparent inputs/outputs. A previous-output input identifies its
+  outpoint but cannot include the spent value without verified state context.
 - UTXO payloads contain ordered transparent create/spend effects. Spend updates
   identify the previous outpoint but do not repeat the previous output value.
+- Binary protobuf fields use reference-counted buffers, so cloning an update for
+  replay and multiple subscribers does not copy block, transaction, or script
+  bytes. Transaction and UTXO views are produced in the same transaction pass.
 
 ## Yellowstone scope mapping
 

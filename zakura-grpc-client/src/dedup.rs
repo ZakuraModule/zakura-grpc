@@ -1,11 +1,12 @@
 use std::collections::{HashSet, VecDeque};
 
+use bytes::Bytes;
 use zakura_grpc_proto::geyser::{subscribe_update, SubscribeUpdate};
 
 /// Number of block heights retained for reconnect duplicate detection.
 pub const DEFAULT_HEIGHT_RETENTION: usize = 250;
 
-type EventKey = (Vec<u8>, u64);
+type EventKey = (Bytes, u64);
 
 #[derive(Clone, Debug)]
 struct HeightBucket {
@@ -98,7 +99,7 @@ mod tests {
 
     fn update(session: u8, height: u32, sequence: u64) -> SubscribeUpdate {
         SubscribeUpdate {
-            session_id: vec![session],
+            session_id: Bytes::from(vec![session]),
             sequence,
             update: Some(subscribe_update::Update::Block(BlockUpdate {
                 height,

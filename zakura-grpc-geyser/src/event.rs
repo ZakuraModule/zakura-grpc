@@ -1,5 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use prost_types::Timestamp;
 use zakura_chain::{
     serialization::ZcashSerialize,
@@ -10,9 +11,11 @@ use zakura_geyser_plugin_interface::{
     BestChainChange, BlockEvent, EventEnvelope, MempoolEventKind, PluginError, PluginEvent,
 };
 use zakura_grpc_proto::geyser::{
-    best_chain_update, subscribe_update, utxo_change, BestChainGrow, BestChainReset,
-    BestChainUpdate, BlockCommitment, BlockUpdate, EventType, MempoolAction, MempoolUpdate,
-    Outpoint, SubscribeUpdate, TransactionUpdate, UtxoChange, UtxoCreated, UtxoSpent, UtxoUpdate,
+    best_chain_update, subscribe_update, transparent_input, utxo_change, BestChainGrow,
+    BestChainReset, BestChainUpdate, BlockCommitment, BlockUpdate, EventType, MempoolAction,
+    MempoolUpdate, Outpoint, SubscribeUpdate, TransactionUpdate, TransparentCoinbaseInput,
+    TransparentInput, TransparentOutput, TransparentPrevoutInput, UtxoChange, UtxoCreated,
+    UtxoSpent, UtxoUpdate,
 };
 
 pub(crate) fn encode_event(
@@ -97,6 +100,16 @@ fn append_block_updates(
             PluginError::new("transaction index exceeds the gRPC protocol's u32 range")
         })?;
         let (transaction_id, auth_digest) = transaction.txid_and_auth_digest();
+        let EncodedTransparentUpdates {
+            transaction_inputs,
+            transaction_outputs,
+            utxo_changes,
+        } = encode_transparent_updates(
+            transaction,
+            transaction_id,
+            transaction_updates,
+            utxo_updates,
+        )?;
 
         if transaction_updates {
             let unmined_transaction_id = encode_unmined_transaction_id(transaction_id, auth_digest);
@@ -110,91 +123,195 @@ fn append_block_updates(
                     transaction_id: transaction_id.to_string(),
                     unmined_transaction_id,
                     auth_digest: auth_digest.map(|digest| digest.to_string()),
-                    transaction: transaction_bytes,
+                    transaction: transaction_bytes.into(),
                     height: block.height.0,
                     block_hash: block.hash.to_string(),
                     transaction_index,
                     commitment: commitment.into(),
                     coinbase: transaction.is_coinbase(),
+                    transparent_inputs: transaction_inputs,
+                    transparent_outputs: transaction_outputs,
                 }),
             ));
         }
 
-        if utxo_updates {
-            let changes = encode_utxo_changes(transaction, transaction_id)?;
-            if !changes.is_empty() {
-                updates.push(new_update(
-                    event,
-                    EventType::Utxo,
-                    subscribe_update::Update::Utxo(UtxoUpdate {
-                        height: block.height.0,
-                        block_hash: block.hash.to_string(),
-                        transaction_id: transaction_id.to_string(),
-                        transaction_index,
-                        commitment: commitment.into(),
-                        changes,
-                    }),
-                ));
-            }
+        if utxo_updates && !utxo_changes.is_empty() {
+            updates.push(new_update(
+                event,
+                EventType::Utxo,
+                subscribe_update::Update::Utxo(UtxoUpdate {
+                    height: block.height.0,
+                    block_hash: block.hash.to_string(),
+                    transaction_id: transaction_id.to_string(),
+                    transaction_index,
+                    commitment: commitment.into(),
+                    changes: utxo_changes,
+                }),
+            ));
         }
     }
 
     Ok(())
 }
 
-fn encode_utxo_changes(
+struct EncodedTransparentUpdates {
+    transaction_inputs: Vec<TransparentInput>,
+    transaction_outputs: Vec<TransparentOutput>,
+    utxo_changes: Vec<UtxoChange>,
+}
+
+fn encode_transparent_updates(
     transaction: &Transaction,
     transaction_id: transaction::Hash,
-) -> Result<Vec<UtxoChange>, PluginError> {
-    let mut changes = Vec::with_capacity(
-        transaction
-            .inputs()
-            .len()
-            .saturating_add(transaction.outputs().len()),
-    );
+    transaction_updates: bool,
+    utxo_updates: bool,
+) -> Result<EncodedTransparentUpdates, PluginError> {
+    let mut transaction_inputs = if transaction_updates {
+        Vec::with_capacity(transaction.inputs().len())
+    } else {
+        Vec::new()
+    };
+    let mut transaction_outputs = if transaction_updates {
+        Vec::with_capacity(transaction.outputs().len())
+    } else {
+        Vec::new()
+    };
+    let mut utxo_changes = if utxo_updates {
+        Vec::with_capacity(
+            transaction
+                .inputs()
+                .len()
+                .saturating_add(transaction.outputs().len()),
+        )
+    } else {
+        Vec::new()
+    };
 
     for (input_index, input) in transaction.inputs().iter().enumerate() {
-        let transparent::Input::PrevOut {
-            outpoint,
-            unlock_script,
-            sequence,
-        } = input
-        else {
-            continue;
-        };
         let input_index = u32::try_from(input_index)
             .map_err(|_| PluginError::new("input index exceeds the gRPC protocol's u32 range"))?;
-        changes.push(UtxoChange {
-            change: Some(utxo_change::Change::Spent(UtxoSpent {
-                outpoint: Some(Outpoint {
-                    transaction_id: outpoint.hash.to_string(),
-                    output_index: outpoint.index,
-                }),
-                input_index,
-                unlock_script: unlock_script.as_raw_bytes().to_vec(),
-                sequence: *sequence,
-            })),
-        });
+        encode_transparent_input(
+            input,
+            input_index,
+            transaction_updates,
+            utxo_updates,
+            &mut transaction_inputs,
+            &mut utxo_changes,
+        );
     }
 
     for (output_index, output) in transaction.outputs().iter().enumerate() {
         let output_index = u32::try_from(output_index)
             .map_err(|_| PluginError::new("output index exceeds the gRPC protocol's u32 range"))?;
-        let value_zat = u64::try_from(output.value.zatoshis())
-            .expect("transparent output values are non-negative by type");
-        changes.push(UtxoChange {
+        encode_transparent_output(
+            output,
+            output_index,
+            transaction_id,
+            transaction_updates,
+            utxo_updates,
+            &mut transaction_outputs,
+            &mut utxo_changes,
+        );
+    }
+
+    Ok(EncodedTransparentUpdates {
+        transaction_inputs,
+        transaction_outputs,
+        utxo_changes,
+    })
+}
+
+fn encode_transparent_input(
+    input: &transparent::Input,
+    input_index: u32,
+    transaction_updates: bool,
+    utxo_updates: bool,
+    transaction_inputs: &mut Vec<TransparentInput>,
+    utxo_changes: &mut Vec<UtxoChange>,
+) {
+    match input {
+        transparent::Input::PrevOut {
+            outpoint,
+            unlock_script,
+            sequence,
+        } => {
+            let outpoint = Outpoint {
+                transaction_id: outpoint.hash.to_string(),
+                output_index: outpoint.index,
+            };
+            let unlock_script = Bytes::copy_from_slice(unlock_script.as_raw_bytes());
+
+            if transaction_updates {
+                transaction_inputs.push(TransparentInput {
+                    input_index,
+                    sequence: *sequence,
+                    input: Some(transparent_input::Input::Prevout(TransparentPrevoutInput {
+                        previous_output: Some(outpoint.clone()),
+                        unlock_script: unlock_script.clone(),
+                    })),
+                });
+            }
+            if utxo_updates {
+                utxo_changes.push(UtxoChange {
+                    change: Some(utxo_change::Change::Spent(UtxoSpent {
+                        outpoint: Some(outpoint),
+                        input_index,
+                        unlock_script,
+                        sequence: *sequence,
+                    })),
+                });
+            }
+        }
+        transparent::Input::Coinbase {
+            height,
+            data,
+            sequence,
+        } if transaction_updates => transaction_inputs.push(TransparentInput {
+            input_index,
+            sequence: *sequence,
+            input: Some(transparent_input::Input::Coinbase(
+                TransparentCoinbaseInput {
+                    height: height.0,
+                    data: Bytes::copy_from_slice(data),
+                },
+            )),
+        }),
+        transparent::Input::Coinbase { .. } => {}
+    }
+}
+
+fn encode_transparent_output(
+    output: &transparent::Output,
+    output_index: u32,
+    transaction_id: transaction::Hash,
+    transaction_updates: bool,
+    utxo_updates: bool,
+    transaction_outputs: &mut Vec<TransparentOutput>,
+    utxo_changes: &mut Vec<UtxoChange>,
+) {
+    let value_zat = u64::try_from(output.value.zatoshis())
+        .expect("transparent output values are non-negative by type");
+    let lock_script = Bytes::copy_from_slice(output.lock_script.as_raw_bytes());
+
+    if transaction_updates {
+        transaction_outputs.push(TransparentOutput {
+            output_index,
+            value_zat,
+            lock_script: lock_script.clone(),
+        });
+    }
+    if utxo_updates {
+        utxo_changes.push(UtxoChange {
             change: Some(utxo_change::Change::Created(UtxoCreated {
                 outpoint: Some(Outpoint {
                     transaction_id: transaction_id.to_string(),
                     output_index,
                 }),
                 value_zat,
-                lock_script: output.lock_script.as_raw_bytes().to_vec(),
+                lock_script,
             })),
         });
     }
-
-    Ok(changes)
 }
 
 fn encode_unmined_transaction_id(
@@ -214,7 +331,7 @@ fn new_update(
 ) -> SubscribeUpdate {
     SubscribeUpdate {
         schema_version: event.schema_version,
-        session_id: event.session_id.0.to_be_bytes().to_vec(),
+        session_id: Bytes::copy_from_slice(&event.session_id.0.to_be_bytes()),
         sequence: 0,
         observed_at: Some(timestamp(event.observed_at)),
         event_type: event_type.into(),
@@ -233,7 +350,7 @@ fn encode_block(block: &BlockEvent, finalized: bool) -> Result<BlockUpdate, Plug
     Ok(BlockUpdate {
         height: block.height.0,
         hash: block.hash.to_string(),
-        block: block_bytes,
+        block: block_bytes.into(),
         receipt_order: block.receipt_order,
         finalized,
     })
@@ -285,6 +402,7 @@ pub(crate) fn block_height(update: &SubscribeUpdate) -> Option<u32> {
 mod tests {
     use zakura_chain::{
         amount::{Amount, NonNegative},
+        block::Height,
         transaction::LockTime,
         transparent::{Input, OutPoint, Output, Script},
     };
@@ -321,26 +439,69 @@ mod tests {
             128
         );
 
-        let changes = encode_utxo_changes(&transaction, transaction_id).unwrap();
-        assert_eq!(changes.len(), 2);
+        let encoded = encode_transparent_updates(&transaction, transaction_id, true, true).unwrap();
+        assert_eq!(encoded.transaction_inputs.len(), 1);
+        assert_eq!(encoded.transaction_outputs.len(), 1);
+        assert_eq!(encoded.utxo_changes.len(), 2);
 
-        let Some(utxo_change::Change::Spent(spent)) = &changes[0].change else {
+        let input = &encoded.transaction_inputs[0];
+        assert_eq!(input.input_index, 0);
+        assert_eq!(input.sequence, 42);
+        let Some(transparent_input::Input::Prevout(prevout)) = &input.input else {
+            panic!("the transparent input must preserve its previous output");
+        };
+        assert_eq!(prevout.unlock_script.as_ref(), [0x51]);
+        assert_eq!(prevout.previous_output.as_ref().unwrap().output_index, 3);
+
+        let output = &encoded.transaction_outputs[0];
+        assert_eq!(output.output_index, 0);
+        assert_eq!(output.value_zat, 123);
+        assert_eq!(output.lock_script.as_ref(), [0x52]);
+
+        let Some(utxo_change::Change::Spent(spent)) = &encoded.utxo_changes[0].change else {
             panic!("the input must produce a spent UTXO change");
         };
         assert_eq!(spent.input_index, 0);
         assert_eq!(spent.sequence, 42);
-        assert_eq!(spent.unlock_script, vec![0x51]);
+        assert_eq!(spent.unlock_script.as_ref(), [0x51]);
         assert_eq!(spent.outpoint.as_ref().unwrap().output_index, 3);
 
-        let Some(utxo_change::Change::Created(created)) = &changes[1].change else {
+        let Some(utxo_change::Change::Created(created)) = &encoded.utxo_changes[1].change else {
             panic!("the output must produce a created UTXO change");
         };
         assert_eq!(created.value_zat, 123);
-        assert_eq!(created.lock_script, vec![0x52]);
+        assert_eq!(created.lock_script.as_ref(), [0x52]);
         assert_eq!(created.outpoint.as_ref().unwrap().output_index, 0);
         assert_eq!(
             created.outpoint.as_ref().unwrap().transaction_id,
             transaction_id.to_string()
         );
+    }
+
+    #[test]
+    fn encodes_coinbase_input_without_a_spent_utxo() {
+        let transaction = Transaction::V1 {
+            inputs: vec![Input::Coinbase {
+                height: Height(99),
+                data: vec![1, 2, 3],
+                sequence: 7,
+            }],
+            outputs: Vec::new(),
+            lock_time: LockTime::unlocked(),
+        };
+
+        let encoded =
+            encode_transparent_updates(&transaction, transaction.hash(), true, true).unwrap();
+        assert!(encoded.transaction_outputs.is_empty());
+        assert!(encoded.utxo_changes.is_empty());
+
+        let input = &encoded.transaction_inputs[0];
+        assert_eq!(input.input_index, 0);
+        assert_eq!(input.sequence, 7);
+        let Some(transparent_input::Input::Coinbase(coinbase)) = &input.input else {
+            panic!("the transparent input must preserve its coinbase data");
+        };
+        assert_eq!(coinbase.height, 99);
+        assert_eq!(coinbase.data.as_ref(), [1, 2, 3]);
     }
 }

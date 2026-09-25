@@ -98,11 +98,6 @@ struct ActiveSubscription {
     updates: Streaming<SubscribeUpdate>,
 }
 
-enum StreamEvent {
-    Command(Option<SubscribeRequest>),
-    Message(Result<Option<SubscribeUpdate>, Status>),
-}
-
 enum Disconnect {
     Ended,
     Status(Status),
@@ -153,13 +148,8 @@ async fn run_subscription(
     });
 
     loop {
-        let event = tokio::select! {
-            command = commands.recv(), if commands_open => StreamEvent::Command(command),
-            message = active.updates.message() => StreamEvent::Message(message),
-        };
-
-        let disconnect = match event {
-            StreamEvent::Command(Some(mut request)) => {
+        let disconnect = tokio::select! {
+            command = commands.recv(), if commands_open => if let Some(mut request) = command {
                 if request.ping.is_none() {
                     request.from_height = None;
                     current_request = request.clone();
@@ -171,24 +161,25 @@ async fn run_subscription(
                 } else {
                     None
                 }
-            }
-            StreamEvent::Command(None) => {
+            } else {
                 commands_open = false;
                 None
-            }
-            StreamEvent::Message(Ok(Some(update))) => {
-                if let Some(height) = update_height(&update) {
-                    checkpoint = Some(height);
+            },
+            message = active.updates.message() => match message {
+                Ok(Some(update)) => {
+                    if let Some(height) = update_height(&update) {
+                        checkpoint = Some(height);
+                    }
+                    if dedup.as_mut().is_none_or(|state| state.observe(&update))
+                        && output.send(Ok(update)).await.is_err()
+                    {
+                        break;
+                    }
+                    None
                 }
-                if dedup.as_mut().is_none_or(|state| state.observe(&update))
-                    && output.send(Ok(update)).await.is_err()
-                {
-                    break;
-                }
-                None
-            }
-            StreamEvent::Message(Ok(None)) => Some(Disconnect::Ended),
-            StreamEvent::Message(Err(status)) => Some(Disconnect::Status(status)),
+                Ok(None) => Some(Disconnect::Ended),
+                Err(status) => Some(Disconnect::Status(status)),
+            },
         };
 
         let Some(disconnect) = disconnect else {

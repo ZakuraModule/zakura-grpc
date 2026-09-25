@@ -13,6 +13,7 @@ name = "config-check"
 path = "src/bin/config-check.rs"
 
 [dependencies]
+bytes = { workspace = true }
 clap = { workspace = true }
 futures-core = { workspace = true }
 metrics = { workspace = true }

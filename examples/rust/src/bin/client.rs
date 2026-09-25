@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tonic::codec::CompressionEncoding;
 use zakura_grpc_client::{ReconnectConfig, ZakuraGrpcClient};
 use zakura_grpc_proto::geyser::{
-    subscribe_update, utxo_change, BlockCommitment, EventType, Outpoint, SubscribeRequest,
-    SubscribeRequestFilter, SubscribeUpdate,
+    subscribe_update, transparent_input, utxo_change, BlockCommitment, EventType, Outpoint,
+    SubscribeRequest, SubscribeRequestFilter, SubscribeUpdate, TransactionUpdate,
 };
 
 #[derive(Debug, Parser)]
@@ -197,22 +197,9 @@ fn print_update(update: &SubscribeUpdate) {
             change.action,
             change.transaction_ids.len()
         ),
-        Some(subscribe_update::Update::Transaction(transaction)) => println!(
-            "sequence={} source_sequence={} event={} filters={:?} commitment={} height={} block={} transaction_index={} transaction_id={} unmined_transaction_id={} auth_digest={} transaction_bytes={} coinbase={}",
-            update.sequence,
-            update.source_sequence,
-            event_type,
-            update.filters,
-            commitment_name(transaction.commitment),
-            transaction.height,
-            transaction.block_hash,
-            transaction.transaction_index,
-            transaction.transaction_id,
-            transaction.unmined_transaction_id,
-            transaction.auth_digest.as_deref().unwrap_or("none"),
-            transaction.transaction.len(),
-            transaction.coinbase
-        ),
+        Some(subscribe_update::Update::Transaction(transaction)) => {
+            print_transaction_update(update, &event_type, transaction);
+        }
         Some(subscribe_update::Update::Utxo(utxo)) => {
             println!(
                 "sequence={} source_sequence={} event={} filters={:?} commitment={} height={} block={} transaction_index={} transaction_id={} changes={}",
@@ -253,6 +240,58 @@ fn print_update(update: &SubscribeUpdate) {
             "sequence={} event={} payload=none",
             update.sequence, event_type
         ),
+    }
+}
+
+fn print_transaction_update(
+    update: &SubscribeUpdate,
+    event_type: &str,
+    transaction: &TransactionUpdate,
+) {
+    println!(
+        "sequence={} source_sequence={} event={} filters={:?} commitment={} height={} block={} transaction_index={} transaction_id={} unmined_transaction_id={} auth_digest={} transaction_bytes={} coinbase={} transparent_inputs={} transparent_outputs={}",
+        update.sequence,
+        update.source_sequence,
+        event_type,
+        update.filters,
+        commitment_name(transaction.commitment),
+        transaction.height,
+        transaction.block_hash,
+        transaction.transaction_index,
+        transaction.transaction_id,
+        transaction.unmined_transaction_id,
+        transaction.auth_digest.as_deref().unwrap_or("none"),
+        transaction.transaction.len(),
+        transaction.coinbase,
+        transaction.transparent_inputs.len(),
+        transaction.transparent_outputs.len()
+    );
+    for input in &transaction.transparent_inputs {
+        match input.input.as_ref() {
+            Some(transparent_input::Input::Prevout(prevout)) => println!(
+                "  input index={} prevout={} sequence={} unlock_script_bytes={}",
+                input.input_index,
+                format_outpoint(prevout.previous_output.as_ref()),
+                input.sequence,
+                prevout.unlock_script.len()
+            ),
+            Some(transparent_input::Input::Coinbase(coinbase)) => println!(
+                "  input index={} coinbase_height={} sequence={} data_bytes={}",
+                input.input_index,
+                coinbase.height,
+                input.sequence,
+                coinbase.data.len()
+            ),
+            None => println!("  input index={} payload=none", input.input_index),
+        }
+    }
+    for output in &transaction.transparent_outputs {
+        println!(
+            "  output index={} value_zat={} lock_script_bytes={}",
+            output.output_index,
+            output.value_zat,
+            output.lock_script.len()
+        );
     }
 }
 

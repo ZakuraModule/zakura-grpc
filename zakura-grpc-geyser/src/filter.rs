@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use tonic::Status;
 use zakura_grpc_proto::geyser::{
     EventType, SubscribeRequest, SubscribeRequestFilter, SubscribeUpdate,
@@ -73,7 +71,7 @@ impl EventFilter {
 
 #[derive(Debug)]
 struct CompiledFilter {
-    kinds: HashSet<i32>,
+    kinds: u64,
     min_height: Option<u32>,
 }
 
@@ -94,7 +92,7 @@ impl CompiledFilter {
             )));
         }
 
-        let mut kinds = HashSet::with_capacity(event_types.len());
+        let mut kinds = 0u64;
         for kind in event_types {
             let parsed = EventType::try_from(*kind)
                 .map_err(|_| Status::invalid_argument(format!("unknown event type {kind}")))?;
@@ -103,19 +101,28 @@ impl CompiledFilter {
                     "EVENT_TYPE_UNSPECIFIED cannot be used as a filter",
                 ));
             }
-            kinds.insert(*kind);
+            kinds |= event_type_bit(*kind)
+                .expect("known protobuf event types fit in the u64 filter bitmask");
         }
 
         Ok(Self { kinds, min_height })
     }
 
     fn matches(&self, update: &SubscribeUpdate) -> bool {
-        let kind_matches = self.kinds.is_empty() || self.kinds.contains(&update.event_type);
+        let kind_matches = self.kinds == 0
+            || event_type_bit(update.event_type)
+                .is_some_and(|event_type| self.kinds & event_type != 0);
         let height_matches = self
             .min_height
             .is_none_or(|minimum| block_height(update).is_some_and(|height| height >= minimum));
         kind_matches && height_matches
     }
+}
+
+fn event_type_bit(event_type: i32) -> Option<u64> {
+    u32::try_from(event_type)
+        .ok()
+        .and_then(|event_type| 1u64.checked_shl(event_type))
 }
 
 fn validate_name(name: &str, limits: &FilterLimits) -> Result<(), Status> {

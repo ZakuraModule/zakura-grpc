@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, pin::Pin, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    pin::Pin,
+    sync::Arc,
+};
 
 use futures_core::Stream;
 use parking_lot::Mutex;
@@ -74,6 +78,7 @@ impl SharedState {
 struct ReplayBuffer {
     capacity: usize,
     heights: VecDeque<u32>,
+    height_set: HashSet<u32>,
     updates: VecDeque<Arc<SubscribeUpdate>>,
 }
 
@@ -82,6 +87,7 @@ impl ReplayBuffer {
         Self {
             capacity,
             heights: VecDeque::new(),
+            height_set: HashSet::new(),
             updates: VecDeque::new(),
         }
     }
@@ -94,7 +100,7 @@ impl ReplayBuffer {
             return;
         };
 
-        if !self.heights.contains(&height) {
+        if self.height_set.insert(height) {
             self.heights.push_back(height);
         }
         self.updates.push_back(update);
@@ -104,6 +110,7 @@ impl ReplayBuffer {
                 .heights
                 .pop_front()
                 .expect("a height exists because the buffer exceeds its capacity");
+            self.height_set.remove(&evicted_height);
             self.updates
                 .retain(|stored| block_height(stored) != Some(evicted_height));
         }
