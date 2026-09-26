@@ -4,9 +4,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tonic::codec::CompressionEncoding;
 use zakura_grpc_client::{ReconnectConfig, ZakuraGrpcClient};
 use zakura_grpc_proto::geyser::{
-    subscribe_update, transparent_input, utxo_change, BlockCommitment, EventType,
+    subscribe_update, transparent_input, utxo_change, BlockCommitment, BlockPayload, EventType,
     MempoolTransactionUpdate, Outpoint, SubscribeRequest, SubscribeRequestFilter, SubscribeUpdate,
-    TransactionUpdate, TransparentInput, TransparentOutput,
+    TransactionUpdate, TransparentInput, TransparentOutput, UtxoUpdate,
 };
 
 #[derive(Debug, Parser)]
@@ -35,32 +35,7 @@ struct Args {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Stream retained events followed by live events.
-    Subscribe {
-        /// First retained block height to replay.
-        #[arg(long)]
-        from_height: Option<u32>,
-        /// Event filters; omit to receive every event type.
-        #[arg(long, value_enum)]
-        event: Vec<EventArg>,
-        /// Exit after this many updates; omit to follow indefinitely.
-        #[arg(long)]
-        max_updates: Option<usize>,
-        /// Reconnect automatically and replay missed retained blocks.
-        #[arg(long)]
-        reconnect: bool,
-        /// Optional named filter returned on matching updates.
-        #[arg(long)]
-        filter_name: Option<String>,
-        /// Ignore block-scoped updates below this height inside the named filter.
-        #[arg(long, requires = "filter_name")]
-        min_height: Option<u32>,
-        /// Match one transaction ID; repeat to match multiple IDs.
-        #[arg(long, requires = "filter_name")]
-        transaction_id: Vec<String>,
-        /// Match one transparent address; repeat to match multiple addresses.
-        #[arg(long, requires = "filter_name")]
-        address: Vec<String>,
-    },
+    Subscribe(Box<SubscribeArgs>),
     /// Show the process-local replay range.
     ReplayInfo,
     /// Call the unary ping endpoint.
@@ -74,6 +49,61 @@ enum Command {
     Health,
 }
 
+#[derive(Debug, clap::Args)]
+struct SubscribeArgs {
+    /// First retained block height to replay.
+    #[arg(long)]
+    from_height: Option<u32>,
+    /// Event filters; omit to receive every event type.
+    #[arg(long, value_enum)]
+    event: Vec<EventArg>,
+    /// Exit after this many updates; omit to follow indefinitely.
+    #[arg(long)]
+    max_updates: Option<usize>,
+    /// Reconnect automatically and replay missed retained blocks.
+    #[arg(long)]
+    reconnect: bool,
+    /// Optional named filter returned on matching updates.
+    #[arg(long)]
+    filter_name: Option<String>,
+    /// Ignore block-scoped updates below this height inside the named filter.
+    #[arg(long, requires = "filter_name")]
+    min_height: Option<u32>,
+    /// Match one transaction ID; repeat to match multiple IDs.
+    #[arg(long, requires = "filter_name")]
+    transaction_id: Vec<String>,
+    /// Match any transparent address; repeat to match multiple addresses.
+    #[arg(long, visible_alias = "address", requires = "filter_name")]
+    address_include: Vec<String>,
+    /// Reject updates containing any transparent address; repeat for multiple addresses.
+    #[arg(long, requires = "filter_name")]
+    address_exclude: Vec<String>,
+    /// Require every transparent address; repeat for multiple addresses.
+    #[arg(long, requires = "filter_name")]
+    address_required: Vec<String>,
+    /// Match coinbase (`true`) or non-coinbase (`false`) transactions.
+    #[arg(long, requires = "filter_name")]
+    coinbase: Option<bool>,
+    /// Match one Zcash transaction serialization version.
+    #[arg(long, requires = "filter_name")]
+    transaction_version: Option<u32>,
+    /// Match whether transparent inputs or outputs are present.
+    #[arg(long, requires = "filter_name")]
+    has_transparent: Option<bool>,
+    /// Match whether Sapling shielded data is present.
+    #[arg(long, requires = "filter_name")]
+    has_sapling: Option<bool>,
+    /// Match whether Orchard shielded data is present.
+    #[arg(long, requires = "filter_name")]
+    has_orchard: Option<bool>,
+    /// Match a minimum known transparent input or output total.
+    #[arg(long, requires = "filter_name")]
+    min_value_zat: Option<u64>,
+    /// Select full block bytes or metadata-only block updates.
+    #[arg(long, value_enum, requires = "filter_name")]
+    block_payload: Option<BlockPayloadArg>,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum EventArg {
     BlockAccepted,
@@ -83,6 +113,21 @@ enum EventArg {
     MempoolTransaction,
     Transaction,
     Utxo,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BlockPayloadArg {
+    MetaOnly,
+    Full,
+}
+
+impl From<BlockPayloadArg> for BlockPayload {
+    fn from(value: BlockPayloadArg) -> Self {
+        match value {
+            BlockPayloadArg::MetaOnly => Self::MetaOnly,
+            BlockPayloadArg::Full => Self::Full,
+        }
+    }
 }
 
 impl From<EventArg> for EventType {
@@ -112,16 +157,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     match args.command {
-        Command::Subscribe {
-            from_height,
-            event,
-            max_updates,
-            reconnect,
-            filter_name,
-            min_height,
-            transaction_id,
-            address,
-        } => {
+        Command::Subscribe(args) => {
+            let SubscribeArgs {
+                from_height,
+                event,
+                max_updates,
+                reconnect,
+                filter_name,
+                min_height,
+                transaction_id,
+                address_include,
+                address_exclude,
+                address_required,
+                coinbase,
+                transaction_version,
+                has_transparent,
+                has_sapling,
+                has_orchard,
+                min_value_zat,
+                block_payload,
+            } = *args;
             if reconnect {
                 builder = builder.set_reconnect_config(ReconnectConfig::default());
             }
@@ -139,7 +194,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             event_types,
                             min_height,
                             transaction_ids: transaction_id,
-                            transparent_addresses: address,
+                            address_include,
+                            address_exclude,
+                            address_required,
+                            coinbase,
+                            transaction_version,
+                            has_transparent,
+                            has_sapling,
+                            has_orchard,
+                            min_value_zat,
+                            block_payload: block_payload
+                                .map_or(BlockPayload::Unspecified, BlockPayload::from)
+                                .into(),
+                            ..SubscribeRequestFilter::default()
                         },
                     )]),
                 ),
@@ -190,13 +257,14 @@ fn print_update(update: &SubscribeUpdate) {
     );
     match update.update.as_ref() {
         Some(subscribe_update::Update::Block(block)) => println!(
-            "sequence={} event={} filters={:?} height={} hash={} block_bytes={} finalized={}",
+            "sequence={} event={} filters={:?} height={} hash={} block_bytes={} payload={} finalized={}",
             update.sequence,
             event_type,
             update.filters,
             block.height,
             block.hash,
             block.block.len(),
+            block_payload_name(block.payload),
             block.finalized
         ),
         Some(subscribe_update::Update::BestChain(change)) => {
@@ -236,42 +304,7 @@ fn print_update(update: &SubscribeUpdate) {
             print_mempool_transaction_update(update, &event_type, transaction);
         }
         Some(subscribe_update::Update::Utxo(utxo)) => {
-            println!(
-                "sequence={} source_sequence={} event={} filters={:?} commitment={} height={} block={} transaction_index={} transaction_id={} changes={}",
-                update.sequence,
-                update.source_sequence,
-                event_type,
-                update.filters,
-                commitment_name(utxo.commitment),
-                utxo.height,
-                utxo.block_hash,
-                utxo.transaction_index,
-                utxo.transaction_id,
-                utxo.changes.len()
-            );
-            for change in &utxo.changes {
-                match change.change.as_ref() {
-                    Some(utxo_change::Change::Created(created)) => println!(
-                        "  created outpoint={} value_zat={} address={} lock_script_bytes={}",
-                        format_outpoint(created.outpoint.as_ref()),
-                        created.value_zat,
-                        created.address.as_deref().unwrap_or("non-standard"),
-                        created.lock_script.len()
-                    ),
-                    Some(utxo_change::Change::Spent(spent)) => println!(
-                        "  spent outpoint={} input_index={} sequence={} unlock_script_bytes={} previous_value_zat={:?} previous_address={} previous_height={:?} previous_from_coinbase={:?}",
-                        format_outpoint(spent.outpoint.as_ref()),
-                        spent.input_index,
-                        spent.sequence,
-                        spent.unlock_script.len(),
-                        spent.previous_value_zat,
-                        spent.previous_address.as_deref().unwrap_or("unavailable"),
-                        spent.previous_height,
-                        spent.previous_from_coinbase
-                    ),
-                    None => println!("  utxo_change payload=none"),
-                }
-            }
+            print_utxo_update(update, &event_type, utxo);
         }
         Some(subscribe_update::Update::Ping(ping)) => {
             println!("event=server-ping id={}", ping.id);
@@ -286,13 +319,59 @@ fn print_update(update: &SubscribeUpdate) {
     }
 }
 
+fn print_utxo_update(update: &SubscribeUpdate, event_type: &str, utxo: &UtxoUpdate) {
+    println!(
+        "sequence={} source_sequence={} event={} filters={:?} commitment={} height={} block={} transaction_index={} transaction_id={} changes={} coinbase={} version={} has_transparent={} has_sapling={} has_orchard={} transparent_input_value_zat={:?} transparent_output_value_zat={}",
+        update.sequence,
+        update.source_sequence,
+        event_type,
+        update.filters,
+        commitment_name(utxo.commitment),
+        utxo.height,
+        utxo.block_hash,
+        utxo.transaction_index,
+        utxo.transaction_id,
+        utxo.changes.len(),
+        utxo.coinbase,
+        utxo.version,
+        utxo.has_transparent,
+        utxo.has_sapling,
+        utxo.has_orchard,
+        utxo.transparent_input_value_zat,
+        utxo.transparent_output_value_zat
+    );
+    for change in &utxo.changes {
+        match change.change.as_ref() {
+            Some(utxo_change::Change::Created(created)) => println!(
+                "  created outpoint={} value_zat={} address={} lock_script_bytes={}",
+                format_outpoint(created.outpoint.as_ref()),
+                created.value_zat,
+                created.address.as_deref().unwrap_or("non-standard"),
+                created.lock_script.len()
+            ),
+            Some(utxo_change::Change::Spent(spent)) => println!(
+                "  spent outpoint={} input_index={} sequence={} unlock_script_bytes={} previous_value_zat={:?} previous_address={} previous_height={:?} previous_from_coinbase={:?}",
+                format_outpoint(spent.outpoint.as_ref()),
+                spent.input_index,
+                spent.sequence,
+                spent.unlock_script.len(),
+                spent.previous_value_zat,
+                spent.previous_address.as_deref().unwrap_or("unavailable"),
+                spent.previous_height,
+                spent.previous_from_coinbase
+            ),
+            None => println!("  utxo_change payload=none"),
+        }
+    }
+}
+
 fn print_transaction_update(
     update: &SubscribeUpdate,
     event_type: &str,
     transaction: &TransactionUpdate,
 ) {
     println!(
-        "sequence={} source_sequence={} event={} filters={:?} commitment={} network={} height={} block={} transaction_index={} transaction_id={} unmined_transaction_id={} auth_digest={} version={} lock_time={} lock_time_is_time={} expiry_height={:?} transaction_bytes={} coinbase={} transparent_inputs={} transparent_outputs={} transparent_input_value_zat={:?} transparent_output_value_zat={}",
+        "sequence={} source_sequence={} event={} filters={:?} commitment={} network={} height={} block={} transaction_index={} transaction_id={} unmined_transaction_id={} auth_digest={} version={} lock_time={} lock_time_is_time={} expiry_height={:?} transaction_bytes={} coinbase={} has_transparent={} has_sapling={} has_orchard={} transparent_inputs={} transparent_outputs={} transparent_input_value_zat={:?} transparent_output_value_zat={}",
         update.sequence,
         update.source_sequence,
         event_type,
@@ -311,6 +390,9 @@ fn print_transaction_update(
         transaction.expiry_height,
         transaction.transaction.len(),
         transaction.coinbase,
+        transaction.has_transparent,
+        transaction.has_sapling,
+        transaction.has_orchard,
         transaction.transparent_inputs.len(),
         transaction.transparent_outputs.len(),
         transaction.transparent_input_value_zat,
@@ -328,7 +410,7 @@ fn print_mempool_transaction_update(
     transaction: &MempoolTransactionUpdate,
 ) {
     println!(
-        "sequence={} source_sequence={} event={} filters={:?} network={} transaction_id={} unmined_transaction_id={} auth_digest={} version={} lock_time={} lock_time_is_time={} expiry_height={:?} transaction_bytes={} transparent_inputs={} transparent_outputs={} transparent_input_value_zat={:?} transparent_output_value_zat={} miner_fee_zat={} admitted_at={:?} admitted_height={:?} conventional_actions={} unpaid_actions={} legacy_sigop_count={} p2sh_sigop_count={} fee_weight_ratio={}",
+        "sequence={} source_sequence={} event={} filters={:?} network={} transaction_id={} unmined_transaction_id={} auth_digest={} version={} lock_time={} lock_time_is_time={} expiry_height={:?} transaction_bytes={} coinbase={} has_transparent={} has_sapling={} has_orchard={} transparent_inputs={} transparent_outputs={} transparent_input_value_zat={:?} transparent_output_value_zat={} miner_fee_zat={} admitted_at={:?} admitted_height={:?} conventional_actions={} unpaid_actions={} legacy_sigop_count={} p2sh_sigop_count={} fee_weight_ratio={}",
         update.sequence,
         update.source_sequence,
         event_type,
@@ -342,6 +424,10 @@ fn print_mempool_transaction_update(
         transaction.lock_time_is_time,
         transaction.expiry_height,
         transaction.transaction.len(),
+        transaction.coinbase,
+        transaction.has_transparent,
+        transaction.has_sapling,
+        transaction.has_orchard,
         transaction.transparent_inputs.len(),
         transaction.transparent_outputs.len(),
         transaction.transparent_input_value_zat,
@@ -400,6 +486,13 @@ fn commitment_name(commitment: i32) -> String {
     BlockCommitment::try_from(commitment).map_or_else(
         |_| commitment.to_string(),
         |commitment| commitment.as_str_name().to_owned(),
+    )
+}
+
+fn block_payload_name(payload: i32) -> String {
+    BlockPayload::try_from(payload).map_or_else(
+        |_| payload.to_string(),
+        |payload| payload.as_str_name().to_owned(),
     )
 }
 

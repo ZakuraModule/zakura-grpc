@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use futures_core::Stream;
 use parking_lot::Mutex;
 use prost::Message;
@@ -531,13 +532,13 @@ async fn send_filtered(
     delivery: &'static str,
 ) -> bool {
     let filter_started = Instant::now();
-    let matched_names = filter.matched_names(&update.message);
+    let filter_match = filter.matched(&update.message);
     metrics::histogram!(
         "plugin.grpc.filter.duration",
         "event" => event_type_label(update.message.event_type),
     )
     .record(filter_started.elapsed().as_secs_f64());
-    let Some(names) = matched_names else {
+    let Some(filter_match) = filter_match else {
         return true;
     };
 
@@ -559,7 +560,19 @@ async fn send_filtered(
         .record(wait_started.elapsed().as_secs_f64());
 
     let mut message = update.message.clone();
-    message.filters = names;
+    message.filters = filter_match.names;
+    if let Some(subscribe_update::Update::Block(block)) = message.update.as_mut() {
+        block.payload = filter_match.block_payload.into();
+        if filter_match.block_payload == zakura_grpc_proto::geyser::BlockPayload::MetaOnly {
+            block.block = Bytes::default();
+        }
+    }
+    let encoded_len =
+        if filter_match.block_payload == zakura_grpc_proto::geyser::BlockPayload::MetaOnly {
+            message.encoded_len()
+        } else {
+            update.encoded_len
+        };
     permit.send(Ok(message));
     metrics::counter!(
         "plugin.grpc.messages_sent.total",
@@ -572,7 +585,7 @@ async fn send_filtered(
         "event" => event_type_label(update.message.event_type),
         "delivery" => delivery,
     )
-    .increment(u64::try_from(update.encoded_len).unwrap_or(u64::MAX));
+    .increment(u64::try_from(encoded_len).unwrap_or(u64::MAX));
     true
 }
 
@@ -584,7 +597,7 @@ pub(crate) async fn mark_serving(reporter: &mut tonic_health::server::HealthRepo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zakura_grpc_proto::geyser::BlockUpdate;
+    use zakura_grpc_proto::geyser::{BlockPayload, BlockUpdate, SubscribeRequestFilter};
 
     fn replay_limits(max_heights: usize) -> ReplayLimits {
         ReplayLimits {
@@ -686,5 +699,41 @@ mod tests {
 
         assert_eq!(replay.first_available_height(), Some(100));
         assert_eq!(replay.latest_height(), Some(200));
+    }
+
+    #[tokio::test]
+    async fn meta_only_filter_strips_raw_block_bytes() {
+        let filter = EventFilter::new(
+            &SubscribeRequest {
+                filters: HashMap::from([(
+                    "metadata".to_owned(),
+                    SubscribeRequestFilter {
+                        event_types: vec![EventType::BlockFinalized.into()],
+                        block_payload: BlockPayload::MetaOnly.into(),
+                        ..SubscribeRequestFilter::default()
+                    },
+                )]),
+                ..SubscribeRequest::default()
+            },
+            &FilterLimits::default(),
+        )
+        .unwrap();
+        let mut message = block_update(10, 1);
+        let Some(subscribe_update::Update::Block(block)) = message.update.as_mut() else {
+            panic!("test update is a block");
+        };
+        block.block = vec![1, 2, 3, 4].into();
+        block.payload = BlockPayload::Full.into();
+        let published = PublishedUpdate::new(message);
+        let (outbound, mut received) = mpsc::channel(1);
+
+        assert!(send_filtered(&outbound, &filter, &published, "test").await);
+        let delivered = received.recv().await.unwrap().unwrap();
+        assert_eq!(delivered.filters, vec!["metadata"]);
+        let Some(subscribe_update::Update::Block(block)) = delivered.update else {
+            panic!("delivered update is a block");
+        };
+        assert!(block.block.is_empty());
+        assert_eq!(block.payload, BlockPayload::MetaOnly as i32);
     }
 }

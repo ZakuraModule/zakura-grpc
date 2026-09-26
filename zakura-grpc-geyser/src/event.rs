@@ -19,8 +19,8 @@ use zakura_geyser_plugin_interface::{
 };
 use zakura_grpc_proto::geyser::{
     best_chain_update, subscribe_update, transparent_input, utxo_change, BestChainGrow,
-    BestChainReset, BestChainUpdate, BlockCommitment, BlockUpdate, CanonicalBlock, EventType,
-    MempoolAction, MempoolTransactionUpdate, MempoolUpdate, Outpoint, SubscribeUpdate,
+    BestChainReset, BestChainUpdate, BlockCommitment, BlockPayload, BlockUpdate, CanonicalBlock,
+    EventType, MempoolAction, MempoolTransactionUpdate, MempoolUpdate, Outpoint, SubscribeUpdate,
     TransactionUpdate, TransparentCoinbaseInput, TransparentInput, TransparentOutput,
     TransparentPrevoutInput, UtxoChange, UtxoCreated, UtxoSpent, UtxoUpdate,
 };
@@ -214,6 +214,10 @@ fn encode_mempool_transaction_update(
             legacy_sigop_count: verified.legacy_sigop_count,
             p2sh_sigop_count: verified.p2sh_sigop_count,
             fee_weight_ratio: verified.fee_weight_ratio,
+            coinbase: transaction.is_coinbase(),
+            has_transparent: transaction.has_transparent_inputs_or_outputs(),
+            has_sapling: transaction.has_sapling_shielded_data(),
+            has_orchard: transaction.has_orchard_shielded_data(),
         }),
     ))
 }
@@ -341,6 +345,9 @@ fn encode_transaction_updates(
                 network: network.to_owned(),
                 transparent_input_value_zat,
                 transparent_output_value_zat,
+                has_transparent: transaction.has_transparent_inputs_or_outputs(),
+                has_sapling: transaction.has_sapling_shielded_data(),
+                has_orchard: transaction.has_orchard_shielded_data(),
             }),
         ));
     }
@@ -356,6 +363,13 @@ fn encode_transaction_updates(
                 transaction_index,
                 commitment: commitment.into(),
                 changes: utxo_changes,
+                coinbase: transaction.is_coinbase(),
+                version: transaction.version(),
+                has_transparent: transaction.has_transparent_inputs_or_outputs(),
+                has_sapling: transaction.has_sapling_shielded_data(),
+                has_orchard: transaction.has_orchard_shielded_data(),
+                transparent_input_value_zat,
+                transparent_output_value_zat,
             }),
         ));
     }
@@ -427,7 +441,7 @@ fn encode_transparent_updates(
     } else {
         Vec::new()
     };
-    let mut transparent_input_value_zat = transaction_updates.then_some(0u64);
+    let mut transparent_input_value_zat = (transaction_updates || utxo_updates).then_some(0u64);
     let mut transparent_output_value_zat = 0u64;
 
     for (input_index, input) in transaction.inputs().iter().enumerate() {
@@ -686,6 +700,7 @@ fn encode_block(block: &BlockEvent, finalized: bool) -> Result<BlockUpdate, Plug
         block: block_bytes.into(),
         receipt_order: block.receipt_order,
         finalized,
+        payload: BlockPayload::Full.into(),
     })
 }
 
@@ -1029,6 +1044,10 @@ mod tests {
         assert_eq!(transaction.admitted_height, Some(55));
         assert_eq!(transaction.transparent_input_value_zat, Some(10_123));
         assert_eq!(transaction.transparent_output_value_zat, 123);
+        assert!(!transaction.coinbase);
+        assert!(transaction.has_transparent);
+        assert!(!transaction.has_sapling);
+        assert!(!transaction.has_orchard);
         assert_eq!(transaction.legacy_sigop_count, 2);
         assert_eq!(transaction.p2sh_sigop_count, 3);
 

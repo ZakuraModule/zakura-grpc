@@ -83,12 +83,28 @@ compression = { accept = ["gzip", "zstd"], send = ["gzip", "zstd"] }
 # x_token = "replace-me"
 subscription_limit = 1000
 subscription_limit_enforce = false
-filter_limits = { max_named_filters = 32, max_event_types = 7, max_name_bytes = 128, max_transaction_ids = 256, max_transparent_addresses = 256, allow_all = true }
 event_encoding_threads = 1
 parallel_encoding_min_transactions = 32
 server_http2_adaptive_window = true
 # server_http2_keepalive_interval_ms = 30000
 # server_http2_keepalive_timeout_ms = 10000
+
+[geyser.plugins.plugin.filter_limits]
+max_named_filters = 32
+max_event_types = 7
+max_name_bytes = 128
+max_transaction_ids = 256
+transaction_id_reject = []
+# Compatibility limit for the old `transparent_addresses` field.
+max_transparent_addresses = 256
+transparent_address_reject = []
+max_address_include = 256
+address_include_reject = []
+max_address_exclude = 256
+address_exclude_reject = []
+max_address_required = 256
+address_required_reject = []
+allow_all = true
 ```
 
 Validate a standalone JSON or TOML file containing the fields from the plugin
@@ -110,14 +126,14 @@ encoding for block or mempool batches containing at least
 Inspect the retained replay range:
 
 ```sh
-cargo run -p zakura-grpc-client-example -- \
+cargo run -p zakura-grpc-client-example --bin client -- \
   --endpoint http://127.0.0.1:10000 replay-info
 ```
 
 Replay from a retained height and continue following live events:
 
 ```sh
-cargo run -p zakura-grpc-client-example -- \
+cargo run -p zakura-grpc-client-example --bin client -- \
   --endpoint http://127.0.0.1:10000 subscribe \
   --from-height 1000000 --reconnect
 ```
@@ -125,7 +141,7 @@ cargo run -p zakura-grpc-client-example -- \
 Filter to finalized blocks only:
 
 ```sh
-cargo run -p zakura-grpc-client-example -- \
+cargo run -p zakura-grpc-client-example --bin client -- \
   --endpoint http://127.0.0.1:10000 subscribe \
   --event block-finalized --filter-name finalized --min-height 1000000
 ```
@@ -133,7 +149,7 @@ cargo run -p zakura-grpc-client-example -- \
 Stream consensus-encoded transactions and their block metadata:
 
 ```sh
-cargo run -p zakura-grpc-client-example -- \
+cargo run -p zakura-grpc-client-example --bin client -- \
   --endpoint http://127.0.0.1:10000 subscribe \
   --event transaction --filter-name transactions --reconnect
 ```
@@ -142,7 +158,7 @@ Stream complete transactions as soon as they enter this node's verified
 mempool (before they are mined):
 
 ```sh
-cargo run -p zakura-grpc-client-example -- \
+cargo run -p zakura-grpc-client-example --bin client -- \
   --endpoint http://127.0.0.1:10000 subscribe \
   --event mempool-transaction --filter-name mempool-transactions --reconnect
 ```
@@ -158,23 +174,58 @@ Filter transaction updates for one wallet address without sending unrelated
 transactions to the client:
 
 ```sh
-cargo run -p zakura-grpc-client-example -- \
+cargo run -p zakura-grpc-client-example --bin client -- \
   --endpoint http://127.0.0.1:10000 subscribe \
   --event transaction --filter-name wallet \
-  --address tmWbBGi7TjExNmLZyMcFpxVh3ZPbGrpbX3H --reconnect
+  --address-include tmWbBGi7TjExNmLZyMcFpxVh3ZPbGrpbX3H --reconnect
 ```
 
-`--address` and `--transaction-id` are repeatable. Address filters match
-decoded transparent inputs when verified previous-output context is available,
-and decoded transparent outputs. TEX filters are normalized to the equivalent
-P2PKH transparent address because the on-chain script does not retain whether
-the sender used a TEX encoding.
+`--address-include`, `--address-exclude`, `--address-required`, and
+`--transaction-id` are repeatable. Different populated filter fields are
+combined with AND. Include matches any listed address, exclude requires none of
+the listed addresses, and required requires every listed address. Address
+filters match decoded transparent inputs when verified previous-output context
+is available and decoded transparent outputs. TEX filters are normalized to
+the equivalent P2PKH transparent address because the on-chain script does not
+retain whether the sender used a TEX encoding. `--address` remains an alias for
+`--address-include`.
+
+Filter by Zcash transaction properties without decoding raw bytes in the
+client:
+
+```sh
+cargo run -p zakura-grpc-client-example --bin client -- \
+  --endpoint http://127.0.0.1:10000 subscribe \
+  --event transaction --filter-name sapling-v5 \
+  --transaction-version 5 --coinbase false \
+  --has-transparent true --has-sapling true --has-orchard false \
+  --min-value-zat 100000 --reconnect
+```
+
+`min_value_zat` compares the known aggregate transparent input value and the
+aggregate transparent output value; either total can satisfy the threshold.
+Shielded values remain private and are not used. If checkpoint verification did
+not retain every previous output, the input total is unknown but the output
+total can still match.
+
+Request lightweight block metadata without consensus-encoded block bytes:
+
+```sh
+cargo run -p zakura-grpc-client-example --bin client -- \
+  --endpoint http://127.0.0.1:10000 subscribe \
+  --event block-finalized --filter-name block-meta \
+  --block-payload meta-only --reconnect
+```
+
+If multiple named filters match the same block, the server sends one update
+with every matching filter name and uses the richest requested representation:
+any matching `full` request wins over `meta-only`.
 
 Stream transparent outputs created and previous outpoints spent by each
 transaction:
 
 ```sh
-cargo run -p zakura-grpc-client-example -- \
+cargo run -p zakura-grpc-client-example --bin client -- \
   --endpoint http://127.0.0.1:10000 subscribe \
   --event utxo --filter-name utxos --reconnect
 ```
@@ -255,6 +306,8 @@ height has been evicted, the server returns `OUT_OF_RANGE`; clients can query
 - The reconnecting Rust client resumes from a height checkpoint and suppresses
   replay duplicates with `(session_id, sequence)`.
 - Full block payloads contain consensus-encoded Zcash block bytes.
+- Block filters can select metadata-only delivery, which keeps height, hash,
+  receipt order, and finalization state while omitting raw block bytes.
 - Transaction payloads contain consensus-encoded transaction bytes, txid,
   unmined ID, optional ZIP-244 auth digest, block position, commitment, and
   decoded transparent inputs/outputs. Recognized P2PKH/P2SH outputs include
@@ -262,7 +315,9 @@ height has been evicted, the server returns `OUT_OF_RANGE`; clients can query
   address, creation height, and coinbase flag when verified context is
   available.
 - UTXO payloads contain ordered transparent create/spend effects. Spend updates
-  carry the same optional verified previous-output context.
+  carry the same optional verified previous-output context. Transaction,
+  mempool-transaction, and UTXO payloads also expose coinbase, version, and
+  transparent/Sapling/Orchard presence metadata for zero-decode filtering.
 - Best-chain resets contain an atomic canonical diff: disconnected blocks are
   tip-first, connected blocks are ancestor-first, and `diff_complete = false`
   tells consumers to recover with historical backfill.

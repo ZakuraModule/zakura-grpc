@@ -6,6 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tonic::{codec::CompressionEncoding, metadata::AsciiMetadataValue};
+use zakura_chain::{transaction, transparent::Address};
 
 /// Configuration owned by one Zakura gRPC plugin instance.
 #[allow(clippy::struct_excessive_bools)]
@@ -196,8 +197,24 @@ pub struct FilterLimits {
     pub max_name_bytes: usize,
     /// Maximum transaction IDs in one named filter.
     pub max_transaction_ids: usize,
-    /// Maximum transparent addresses in one named filter.
+    /// Transaction IDs clients cannot request.
+    pub transaction_id_reject: Vec<String>,
+    /// Maximum addresses in the deprecated `transparent_addresses` field.
     pub max_transparent_addresses: usize,
+    /// Addresses rejected from the deprecated `transparent_addresses` field.
+    pub transparent_address_reject: Vec<String>,
+    /// Maximum addresses in one `address_include` filter.
+    pub max_address_include: usize,
+    /// Addresses clients cannot use in `address_include`.
+    pub address_include_reject: Vec<String>,
+    /// Maximum addresses in one `address_exclude` filter.
+    pub max_address_exclude: usize,
+    /// Addresses clients cannot use in `address_exclude`.
+    pub address_exclude_reject: Vec<String>,
+    /// Maximum addresses in one `address_required` filter.
+    pub max_address_required: usize,
+    /// Addresses clients cannot use in `address_required`.
+    pub address_required_reject: Vec<String>,
     /// Allow an empty filter to subscribe to every event type.
     pub allow_all: bool,
 }
@@ -213,11 +230,28 @@ impl FilterLimits {
         if self.max_name_bytes == 0 {
             return Err(ConfigError::ZeroMaxFilterNameBytes);
         }
-        if self.max_transaction_ids == 0 {
-            return Err(ConfigError::ZeroMaxTransactionIds);
+        for transaction_id in &self.transaction_id_reject {
+            transaction_id
+                .parse::<transaction::Hash>()
+                .map_err(|_| ConfigError::InvalidRejectedTransactionId(transaction_id.clone()))?;
         }
-        if self.max_transparent_addresses == 0 {
-            return Err(ConfigError::ZeroMaxTransparentAddresses);
+        for (filter, addresses) in [
+            (
+                "transparent_address_reject",
+                &self.transparent_address_reject,
+            ),
+            ("address_include_reject", &self.address_include_reject),
+            ("address_exclude_reject", &self.address_exclude_reject),
+            ("address_required_reject", &self.address_required_reject),
+        ] {
+            for address in addresses {
+                address.parse::<Address>().map_err(|_| {
+                    ConfigError::InvalidRejectedTransparentAddress {
+                        filter,
+                        address: address.clone(),
+                    }
+                })?;
+            }
         }
         Ok(())
     }
@@ -230,7 +264,15 @@ impl Default for FilterLimits {
             max_event_types: 7,
             max_name_bytes: 128,
             max_transaction_ids: 256,
+            transaction_id_reject: Vec::new(),
             max_transparent_addresses: 256,
+            transparent_address_reject: Vec::new(),
+            max_address_include: 256,
+            address_include_reject: Vec::new(),
+            max_address_exclude: 256,
+            address_exclude_reject: Vec::new(),
+            max_address_required: 256,
+            address_required_reject: Vec::new(),
             allow_all: true,
         }
     }
@@ -284,12 +326,17 @@ pub enum ConfigError {
     /// Filter names need a positive size limit.
     #[error("filter_limits.max_name_bytes must be greater than zero")]
     ZeroMaxFilterNameBytes,
-    /// At least one transaction ID must be representable in a filter.
-    #[error("filter_limits.max_transaction_ids must be greater than zero")]
-    ZeroMaxTransactionIds,
-    /// At least one transparent address must be representable in a filter.
-    #[error("filter_limits.max_transparent_addresses must be greater than zero")]
-    ZeroMaxTransparentAddresses,
+    /// A transaction ID reject-list entry must be valid.
+    #[error("filter_limits.transaction_id_reject contains invalid transaction ID {0:?}")]
+    InvalidRejectedTransactionId(String),
+    /// An address reject-list entry must be a valid transparent address.
+    #[error("filter_limits.{filter} contains invalid transparent address {address:?}")]
+    InvalidRejectedTransparentAddress {
+        /// Reject-list field containing the invalid value.
+        filter: &'static str,
+        /// Invalid configured transparent address.
+        address: String,
+    },
 }
 
 #[cfg(test)]
@@ -377,6 +424,38 @@ mod tests {
         assert_eq!(
             config.validate(),
             Err(ConfigError::ZeroSubscriptionPingInterval)
+        );
+    }
+
+    #[test]
+    fn invalid_filter_reject_lists_are_rejected_at_startup() {
+        let invalid_transaction = Config {
+            filter_limits: FilterLimits {
+                transaction_id_reject: vec!["not-a-transaction-id".to_owned()],
+                ..FilterLimits::default()
+            },
+            ..Config::default()
+        };
+        assert_eq!(
+            invalid_transaction.validate(),
+            Err(ConfigError::InvalidRejectedTransactionId(
+                "not-a-transaction-id".to_owned()
+            ))
+        );
+
+        let invalid_address = Config {
+            filter_limits: FilterLimits {
+                address_required_reject: vec!["not-an-address".to_owned()],
+                ..FilterLimits::default()
+            },
+            ..Config::default()
+        };
+        assert_eq!(
+            invalid_address.validate(),
+            Err(ConfigError::InvalidRejectedTransparentAddress {
+                filter: "address_required_reject",
+                address: "not-an-address".to_owned(),
+            })
         );
     }
 }

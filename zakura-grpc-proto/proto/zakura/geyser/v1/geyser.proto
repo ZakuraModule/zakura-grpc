@@ -43,9 +43,35 @@ message SubscribeRequestFilter {
   optional uint32 min_height = 2;
   // Match transaction-scoped updates containing one of these transaction IDs.
   repeated string transaction_ids = 3;
-  // Match transaction or UTXO updates involving one of these decoded
-  // transparent addresses.
+  // Deprecated alias for address_include.
   repeated string transparent_addresses = 4;
+  // Match when at least one decoded transparent address is present.
+  repeated string address_include = 5;
+  // Match only when none of these decoded transparent addresses is present.
+  repeated string address_exclude = 6;
+  // Match only when every listed decoded transparent address is present.
+  repeated string address_required = 7;
+  // Match coinbase or non-coinbase transaction-scoped updates.
+  optional bool coinbase = 8;
+  // Match one Zcash transaction serialization version.
+  optional uint32 transaction_version = 9;
+  // Match whether the transaction contains transparent inputs or outputs.
+  optional bool has_transparent = 10;
+  // Match whether the transaction contains Sapling shielded data.
+  optional bool has_sapling = 11;
+  // Match whether the transaction contains Orchard shielded data.
+  optional bool has_orchard = 12;
+  // Match when a known transparent input total or output total is at least this value.
+  optional uint64 min_value_zat = 13;
+  // Select raw full block bytes or metadata-only BlockUpdate payloads.
+  // Unspecified preserves the full-block behavior of earlier clients.
+  BlockPayload block_payload = 14;
+}
+
+enum BlockPayload {
+  BLOCK_PAYLOAD_UNSPECIFIED = 0;
+  BLOCK_PAYLOAD_META_ONLY = 1;
+  BLOCK_PAYLOAD_FULL = 2;
 }
 
 message SubscribeUpdate {
@@ -89,6 +115,7 @@ message BlockUpdate {
   bytes block = 3;
   optional uint64 receipt_order = 4;
   bool finalized = 5;
+  BlockPayload payload = 6;
 }
 
 message BestChainUpdate {
@@ -159,6 +186,9 @@ message TransactionUpdate {
   // Present when verified context resolved every previous transparent output.
   optional uint64 transparent_input_value_zat = 17;
   uint64 transparent_output_value_zat = 18;
+  bool has_transparent = 19;
+  bool has_sapling = 20;
+  bool has_orchard = 21;
 }
 
 message MempoolTransactionUpdate {
@@ -186,6 +216,10 @@ message MempoolTransactionUpdate {
   uint32 legacy_sigop_count = 19;
   uint32 p2sh_sigop_count = 20;
   float fee_weight_ratio = 21;
+  bool coinbase = 22;
+  bool has_transparent = 23;
+  bool has_sapling = 24;
+  bool has_orchard = 25;
 }
 
 message TransparentInput {
@@ -267,6 +301,13 @@ message UtxoUpdate {
   // Changes are ordered with spends first, followed by created outputs. Input
   // and output indexes preserve their order inside the transaction.
   repeated UtxoChange changes = 6;
+  bool coinbase = 7;
+  uint32 version = 8;
+  bool has_transparent = 9;
+  bool has_sapling = 10;
+  bool has_orchard = 11;
+  optional uint64 transparent_input_value_zat = 12;
+  uint64 transparent_output_value_zat = 13;
 }
 
 message PongUpdate {
