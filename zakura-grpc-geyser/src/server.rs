@@ -439,6 +439,18 @@ impl GrpcService {
     }
 }
 
+async fn receive_initial_filter(
+    inbound: &mut Streaming<SubscribeRequest>,
+    limits: &FilterLimits,
+) -> Result<(EventFilter, Option<u32>), Status> {
+    let request = inbound
+        .message()
+        .await?
+        .ok_or_else(|| Status::invalid_argument("the first subscribe request is required"))?;
+    let filter = EventFilter::new(&request, limits)?;
+    Ok((filter, request.from_height))
+}
+
 #[tonic::async_trait]
 impl Geyser for GrpcService {
     type SubscribeStream = Pin<Box<dyn Stream<Item = SubscribeResult> + Send + Sync + 'static>>;
@@ -450,12 +462,9 @@ impl Geyser for GrpcService {
         self.auth.authorize(&request)?;
         let subscription_guard = self.subscriptions.acquire(&request)?;
         let mut inbound = request.into_inner();
-        let initial = inbound
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("the first subscribe request is required"))?;
-        let mut filter = EventFilter::new(&initial, &self.filter_limits)?;
-        let (mut live, replay) = self.state.subscribe(initial.from_height)?;
+        let (mut filter, from_height) =
+            receive_initial_filter(&mut inbound, &self.filter_limits).await?;
+        let (mut live, replay) = self.state.subscribe(from_height)?;
         let (outbound_tx, outbound_rx) = mpsc::channel(self.state.client_channel_capacity);
         let filter_limits = Arc::clone(&self.filter_limits);
         let subscription_ping_interval = self.subscription_ping_interval;
@@ -476,9 +485,10 @@ impl Geyser for GrpcService {
                 interval.tick().await;
             }
             let mut ping_id = -1i32;
+            let mut inbound_open = true;
             loop {
                 tokio::select! {
-                    request = inbound.message() => {
+                    request = inbound.message(), if inbound_open => {
                         match request {
                             Ok(Some(request)) => {
                                 if let Some(ping) = request.ping {
@@ -498,7 +508,10 @@ impl Geyser for GrpcService {
                                     }
                                 }
                             }
-                            Ok(None) => break,
+                            Ok(None) => {
+                                inbound_open = false;
+                                debug!("gRPC subscriber closed its request stream; keeping response stream open");
+                            }
                             Err(error) => {
                                 debug!(?error, "gRPC subscriber request stream failed");
                                 break;
