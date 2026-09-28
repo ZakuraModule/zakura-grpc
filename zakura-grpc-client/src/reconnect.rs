@@ -56,6 +56,15 @@ pub enum ReconnectionPolicy {
     },
 }
 
+/// Action taken when the server can no longer replay the requested checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayGapPolicy {
+    /// Surface `OUT_OF_RANGE` and stop instead of silently losing events.
+    Fail,
+    /// Explicitly discard the unavailable gap and resume at the live head.
+    SkipToLive,
+}
+
 /// Automatic reconnect behavior for subscription streams.
 #[derive(Clone, Debug)]
 pub struct ReconnectConfig {
@@ -65,6 +74,8 @@ pub struct ReconnectConfig {
     pub policy: ReconnectionPolicy,
     /// Heights replayed before the latest observed height to cover same-height ordering races.
     pub checkpoint_height_buffer: u32,
+    /// Behavior when the requested replay checkpoint has been evicted.
+    pub replay_gap_policy: ReplayGapPolicy,
 }
 
 impl Default for ReconnectConfig {
@@ -75,6 +86,7 @@ impl Default for ReconnectConfig {
                 height_retention: DEFAULT_HEIGHT_RETENTION,
             },
             checkpoint_height_buffer: 2,
+            replay_gap_policy: ReplayGapPolicy::Fail,
         }
     }
 }
@@ -91,6 +103,13 @@ impl ReconnectConfig {
     #[must_use]
     pub fn with_height_retention(mut self, height_retention: usize) -> Self {
         self.policy = ReconnectionPolicy::RecoverMissedData { height_retention };
+        self
+    }
+
+    /// Selects the behavior for an unavailable replay checkpoint.
+    #[must_use]
+    pub const fn with_replay_gap_policy(mut self, policy: ReplayGapPolicy) -> Self {
+        self.replay_gap_policy = policy;
         self
     }
 }
@@ -236,43 +255,89 @@ async fn run_subscription(
                 break;
             }
             if status.code() == Code::OutOfRange {
-                checkpoint = None;
-                current_request.from_height = None;
+                match config.replay_gap_policy {
+                    ReplayGapPolicy::Fail => {
+                        let _ = output.send(Err(status.clone())).await;
+                        break;
+                    }
+                    ReplayGapPolicy::SkipToLive => {
+                        checkpoint = None;
+                        current_request.from_height = None;
+                    }
+                }
             }
         }
 
-        let mut reconnect_request = current_request.clone();
-        reconnect_request.from_height = match config.policy {
-            ReconnectionPolicy::SkipMissedData => None,
-            ReconnectionPolicy::RecoverMissedData { .. } => checkpoint
-                .map(|height| height.saturating_sub(config.checkpoint_height_buffer))
-                .or(current_request.from_height),
-        };
-
-        warn!(
-            from_height = reconnect_request.from_height,
-            "Zakura gRPC subscription disconnected; reconnecting"
-        );
-        match connect_with_backoff(
+        match reconnect_subscription(
             &endpoint,
             &interceptor,
             &options,
-            reconnect_request,
-            &config.backoff,
+            &mut current_request,
+            &mut checkpoint,
+            config,
         )
         .await
         {
             Ok(subscription) => active = subscription,
             Err(error) => {
-                let _ = output
-                    .send(Err(Status::unavailable(format!(
-                        "subscription reconnect failed: {error}"
-                    ))))
-                    .await;
+                let status = match error {
+                    ZakuraGrpcClientError::Status(status) => status,
+                    ZakuraGrpcClientError::Transport(error) => {
+                        Status::unavailable(format!("subscription reconnect failed: {error}"))
+                    }
+                };
+                let _ = output.send(Err(status)).await;
                 break;
             }
         }
     }
+}
+
+async fn reconnect_subscription(
+    endpoint: &Endpoint,
+    interceptor: &MetadataInterceptor,
+    options: &ClientOptions,
+    current_request: &mut SubscribeRequest,
+    checkpoint: &mut Option<u32>,
+    config: &ReconnectConfig,
+) -> Result<ActiveSubscription, ZakuraGrpcClientError> {
+    let mut reconnect_request = current_request.clone();
+    reconnect_request.from_height = match config.policy {
+        ReconnectionPolicy::SkipMissedData => None,
+        ReconnectionPolicy::RecoverMissedData { .. } => checkpoint
+            .map(|height| height.saturating_sub(config.checkpoint_height_buffer))
+            .or(current_request.from_height),
+    };
+
+    warn!(
+        from_height = reconnect_request.from_height,
+        "Zakura gRPC subscription disconnected; reconnecting"
+    );
+    let result = connect_with_backoff(
+        endpoint,
+        interceptor,
+        options,
+        reconnect_request.clone(),
+        &config.backoff,
+    )
+    .await;
+    if !matches!(&result, Err(error) if is_out_of_range_error(error))
+        || config.replay_gap_policy == ReplayGapPolicy::Fail
+    {
+        return result;
+    }
+
+    *checkpoint = None;
+    current_request.from_height = None;
+    reconnect_request.from_height = None;
+    connect_with_backoff(
+        endpoint,
+        interceptor,
+        options,
+        reconnect_request,
+        &config.backoff,
+    )
+    .await
 }
 
 async fn connect_with_backoff(
@@ -326,8 +391,14 @@ async fn connect_once(
 fn is_recoverable_client_error(error: &ZakuraGrpcClientError) -> bool {
     match error {
         ZakuraGrpcClientError::Transport(_) => true,
-        ZakuraGrpcClientError::Status(status) => is_recoverable_status(status.code()),
+        ZakuraGrpcClientError::Status(status) => {
+            status.code() != Code::OutOfRange && is_recoverable_status(status.code())
+        }
     }
+}
+
+fn is_out_of_range_error(error: &ZakuraGrpcClientError) -> bool {
+    matches!(error, ZakuraGrpcClientError::Status(status) if status.code() == Code::OutOfRange)
 }
 
 const fn is_recoverable_status(code: Code) -> bool {
@@ -359,9 +430,11 @@ mod tests {
 
     #[test]
     fn default_policy_recovers_missed_data() {
+        let config = ReconnectConfig::default();
         assert!(matches!(
-            ReconnectConfig::default().policy,
+            config.policy,
             ReconnectionPolicy::RecoverMissedData { .. }
         ));
+        assert_eq!(config.replay_gap_policy, ReplayGapPolicy::Fail);
     }
 }

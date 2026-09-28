@@ -292,6 +292,10 @@ split by event and live/replay delivery.
 height has been evicted, the server returns `OUT_OF_RANGE`; clients can query
 `SubscribeReplayInfo` to discover the first retained height.
 
+Automatic reconnect fails closed on an unavailable replay checkpoint by
+default. Applications that intentionally prefer the live head over gap-free
+delivery can set `ReplayGapPolicy::SkipToLive` in `ReconnectConfig`.
+
 ## Delivery model
 
 - The Zakura plugin manager isolates node callbacks from gRPC work.

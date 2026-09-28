@@ -29,7 +29,7 @@ use zakura_grpc_proto::geyser::{
 
 pub use builder::{ZakuraGrpcBuilder, ZakuraGrpcBuilderError, ZakuraGrpcBuilderResult};
 pub use dedup::{DedupState, DEFAULT_HEIGHT_RETENTION};
-pub use reconnect::{Backoff, ReconnectConfig, ReconnectionPolicy};
+pub use reconnect::{Backoff, ReconnectConfig, ReconnectionPolicy, ReplayGapPolicy};
 pub use tonic::transport::ClientTlsConfig;
 
 const SUBSCRIPTION_REQUEST_CAPACITY: usize = 1_000;

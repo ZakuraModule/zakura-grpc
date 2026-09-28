@@ -114,11 +114,26 @@ impl SharedState {
     fn replay_info(&self) -> SubscribeReplayInfoResponse {
         let mut replay = self.replay.lock();
         replay.evict(Instant::now());
+        let first_update = replay
+            .buckets
+            .front()
+            .and_then(|bucket| bucket.updates.first());
+        let last_update = replay
+            .buckets
+            .back()
+            .and_then(|bucket| bucket.updates.last());
         SubscribeReplayInfoResponse {
             first_available_height: replay.first_available_height(),
             latest_height: replay.latest_height(),
             retained_block_capacity: u32::try_from(replay.limits.height_capacity)
                 .unwrap_or(u32::MAX),
+            session_id: first_update
+                .map_or_else(Bytes::new, |update| update.message.session_id.clone()),
+            first_available_sequence: first_update.map(|update| update.message.sequence),
+            latest_sequence: last_update.map(|update| update.message.sequence),
+            first_available_hash: replay.first_hash(),
+            latest_hash: replay.latest_hash(),
+            replay_ready: first_update.is_some(),
         }
     }
 }
@@ -251,13 +266,19 @@ impl ReplayBuffer {
 
     fn snapshot(&mut self, from_height: Option<u32>) -> Result<ReplaySnapshot, Status> {
         self.evict(Instant::now());
-        if let (Some(requested), Some(first_available)) =
-            (from_height, self.first_available_height())
-        {
-            if requested < first_available {
-                return Err(Status::out_of_range(format!(
-                    "events from height {requested} are not available; first available height is {first_available}"
-                )));
+        if let Some(requested) = from_height {
+            match self.first_available_height() {
+                Some(first_available) if requested < first_available => {
+                    return Err(Status::out_of_range(format!(
+                        "events from height {requested} are not available; first available height is {first_available}"
+                    )));
+                }
+                None => {
+                    return Err(Status::out_of_range(format!(
+                        "events from height {requested} are not available; the replay window is empty"
+                    )));
+                }
+                Some(_) => {}
             }
         }
 
@@ -277,6 +298,25 @@ impl ReplayBuffer {
         Ok(ReplaySnapshot { updates, watermark })
     }
 
+    fn first_hash(&self) -> Option<String> {
+        let height = self.first_available_height()?;
+        self.buckets
+            .iter()
+            .filter(|bucket| bucket.height == height)
+            .flat_map(|bucket| &bucket.updates)
+            .find_map(|update| update_block_hash(&update.message))
+    }
+
+    fn latest_hash(&self) -> Option<String> {
+        let height = self.latest_height()?;
+        self.buckets
+            .iter()
+            .rev()
+            .filter(|bucket| bucket.height == height)
+            .flat_map(|bucket| bucket.updates.iter().rev())
+            .find_map(|update| update_block_hash(&update.message))
+    }
+
     fn first_available_height(&self) -> Option<u32> {
         self.height_counts.keys().copied().min()
     }
@@ -291,6 +331,19 @@ impl ReplayBuffer {
             .set(usize_metric_value(self.height_counts.len()));
         metrics::gauge!("plugin.grpc.replay.events").set(usize_metric_value(self.event_count));
         metrics::gauge!("plugin.grpc.replay.bytes").set(usize_metric_value(self.encoded_bytes));
+    }
+}
+
+fn update_block_hash(update: &SubscribeUpdate) -> Option<String> {
+    match update.update.as_ref()? {
+        subscribe_update::Update::Block(block) => Some(block.hash.clone()),
+        subscribe_update::Update::BestChain(best_chain) => Some(best_chain.hash.clone()),
+        subscribe_update::Update::Transaction(transaction) => Some(transaction.block_hash.clone()),
+        subscribe_update::Update::Utxo(utxo) => Some(utxo.block_hash.clone()),
+        subscribe_update::Update::Mempool(_)
+        | subscribe_update::Update::MempoolTransaction(_)
+        | subscribe_update::Update::Ping(_)
+        | subscribe_update::Update::Pong(_) => None,
     }
 }
 
@@ -646,6 +699,16 @@ mod tests {
 
         let status = replay.snapshot(Some(20)).unwrap_err();
         assert_eq!(status.code(), tonic::Code::OutOfRange);
+    }
+
+    #[test]
+    fn replay_rejects_checkpoint_when_window_is_empty() {
+        let mut replay = ReplayBuffer::new(replay_limits(1));
+
+        let status = replay.snapshot(Some(20)).unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::OutOfRange);
+        assert!(status.message().contains("replay window is empty"));
     }
 
     #[test]

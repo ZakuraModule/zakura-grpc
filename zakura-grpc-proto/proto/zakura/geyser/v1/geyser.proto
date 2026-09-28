@@ -325,6 +325,15 @@ message SubscribeReplayInfoResponse {
   optional uint32 first_available_height = 1;
   optional uint32 latest_height = 2;
   uint32 retained_block_capacity = 3;
+  // Node event-producing session represented by the retained replay window.
+  // Empty when the replay window has not retained any events yet.
+  bytes session_id = 4;
+  optional uint64 first_available_sequence = 5;
+  optional uint64 latest_sequence = 6;
+  optional string first_available_hash = 7;
+  optional string latest_hash = 8;
+  // True only when at least one replay bucket is available.
+  bool replay_ready = 9;
 }
 
 message PingRequest {
