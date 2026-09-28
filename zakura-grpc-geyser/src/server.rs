@@ -21,14 +21,14 @@ use zakura_grpc_proto::geyser::{
     geyser_server::{Geyser, GeyserServer},
     subscribe_update, EventType, GetVersionRequest, GetVersionResponse, PingRequest, PingUpdate,
     PongResponse, PongUpdate, SubscribeReplayInfoRequest, SubscribeReplayInfoResponse,
-    SubscribeRequest, SubscribeUpdate,
+    SubscribeRequest, SubscribeUpdate, TransactionPayload,
 };
 
 use crate::{
     auth::{SubscriptionGuard, SubscriptionTracker, TokenAuth},
     config::{Config, FilterLimits},
     event::block_height,
-    filter::EventFilter,
+    filter::{EventFilter, FilterMatch},
 };
 
 type SubscribeResult = Result<SubscribeUpdate, Status>;
@@ -699,19 +699,9 @@ async fn send_filtered(
         .record(wait_started.elapsed().as_secs_f64());
 
     let mut message = update.message.clone();
+    apply_payload_projection(&mut message, &filter_match);
     message.filters = filter_match.names;
-    if let Some(subscribe_update::Update::Block(block)) = message.update.as_mut() {
-        block.payload = filter_match.block_payload.into();
-        if filter_match.block_payload == zakura_grpc_proto::geyser::BlockPayload::MetaOnly {
-            block.block = Bytes::default();
-        }
-    }
-    let encoded_len =
-        if filter_match.block_payload == zakura_grpc_proto::geyser::BlockPayload::MetaOnly {
-            message.encoded_len()
-        } else {
-            update.encoded_len
-        };
+    let encoded_len = message.encoded_len();
     permit.send(Ok(message));
     metrics::counter!(
         "plugin.grpc.messages_sent.total",
@@ -728,6 +718,61 @@ async fn send_filtered(
     true
 }
 
+fn apply_payload_projection(message: &mut SubscribeUpdate, filter_match: &FilterMatch) {
+    match message.update.as_mut() {
+        Some(subscribe_update::Update::Block(block)) => {
+            block.payload = filter_match.block_payload.into();
+            if filter_match.block_payload == zakura_grpc_proto::geyser::BlockPayload::MetaOnly {
+                block.block = Bytes::new();
+            }
+        }
+        Some(subscribe_update::Update::Transaction(transaction)) => {
+            transaction.payload = filter_match.transaction_payload.into();
+            match filter_match.transaction_payload {
+                TransactionPayload::MetaOnly => {
+                    transaction.transaction = Bytes::new();
+                    transaction.transparent_inputs.clear();
+                    transaction.transparent_outputs.clear();
+                }
+                TransactionPayload::RawOnly => {
+                    transaction.transparent_inputs.clear();
+                    transaction.transparent_outputs.clear();
+                }
+                TransactionPayload::TransparentOnly => {
+                    transaction.transaction = Bytes::new();
+                }
+                TransactionPayload::Unspecified | TransactionPayload::Full => {}
+            }
+        }
+        Some(subscribe_update::Update::MempoolTransaction(transaction)) => {
+            transaction.payload = filter_match.transaction_payload.into();
+            match filter_match.transaction_payload {
+                TransactionPayload::MetaOnly => {
+                    transaction.transaction = Bytes::new();
+                    transaction.transparent_inputs.clear();
+                    transaction.transparent_outputs.clear();
+                }
+                TransactionPayload::RawOnly => {
+                    transaction.transparent_inputs.clear();
+                    transaction.transparent_outputs.clear();
+                }
+                TransactionPayload::TransparentOnly => {
+                    transaction.transaction = Bytes::new();
+                }
+                TransactionPayload::Unspecified | TransactionPayload::Full => {}
+            }
+        }
+        Some(
+            subscribe_update::Update::BestChain(_)
+            | subscribe_update::Update::Mempool(_)
+            | subscribe_update::Update::Utxo(_)
+            | subscribe_update::Update::Ping(_)
+            | subscribe_update::Update::Pong(_),
+        )
+        | None => {}
+    }
+}
+
 pub(crate) async fn mark_serving(reporter: &mut tonic_health::server::HealthReporter) {
     reporter.set_serving::<GeyserServer<GrpcService>>().await;
     info!("Zakura gRPC health service is serving");
@@ -736,7 +781,10 @@ pub(crate) async fn mark_serving(reporter: &mut tonic_health::server::HealthRepo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zakura_grpc_proto::geyser::{BlockPayload, BlockUpdate, SubscribeRequestFilter};
+    use zakura_grpc_proto::geyser::{
+        BlockPayload, BlockUpdate, MempoolTransactionUpdate, SubscribeRequestFilter,
+        TransactionUpdate, TransparentInput, TransparentOutput,
+    };
 
     fn replay_limits(max_heights: usize) -> ReplayLimits {
         ReplayLimits {
@@ -848,6 +896,82 @@ mod tests {
 
         assert_eq!(replay.first_available_height(), Some(100));
         assert_eq!(replay.latest_height(), Some(200));
+    }
+
+    #[test]
+    fn transaction_payload_projection_strips_only_unrequested_data() {
+        for (payload, keeps_raw, keeps_transparent) in [
+            (TransactionPayload::Full, true, true),
+            (TransactionPayload::MetaOnly, false, false),
+            (TransactionPayload::RawOnly, true, false),
+            (TransactionPayload::TransparentOnly, false, true),
+        ] {
+            let mut message = SubscribeUpdate {
+                update: Some(subscribe_update::Update::Transaction(TransactionUpdate {
+                    transaction: Bytes::from_static(&[1, 2, 3]),
+                    transparent_inputs: vec![TransparentInput::default()],
+                    transparent_outputs: vec![TransparentOutput::default()],
+                    ..TransactionUpdate::default()
+                })),
+                ..SubscribeUpdate::default()
+            };
+            apply_payload_projection(
+                &mut message,
+                &FilterMatch {
+                    names: Vec::new(),
+                    block_payload: BlockPayload::Full,
+                    transaction_payload: payload,
+                },
+            );
+
+            let Some(subscribe_update::Update::Transaction(transaction)) = message.update else {
+                panic!("test update is a transaction");
+            };
+            assert_eq!(transaction.payload, payload as i32);
+            assert_eq!(!transaction.transaction.is_empty(), keeps_raw);
+            assert_eq!(
+                !transaction.transparent_inputs.is_empty(),
+                keeps_transparent
+            );
+            assert_eq!(
+                !transaction.transparent_outputs.is_empty(),
+                keeps_transparent
+            );
+        }
+    }
+
+    #[test]
+    fn mempool_transaction_payload_projection_is_applied() {
+        let mut message = SubscribeUpdate {
+            update: Some(subscribe_update::Update::MempoolTransaction(
+                MempoolTransactionUpdate {
+                    transaction: Bytes::from_static(&[1, 2, 3]),
+                    transparent_inputs: vec![TransparentInput::default()],
+                    transparent_outputs: vec![TransparentOutput::default()],
+                    ..MempoolTransactionUpdate::default()
+                },
+            )),
+            ..SubscribeUpdate::default()
+        };
+        apply_payload_projection(
+            &mut message,
+            &FilterMatch {
+                names: Vec::new(),
+                block_payload: BlockPayload::Full,
+                transaction_payload: TransactionPayload::TransparentOnly,
+            },
+        );
+
+        let Some(subscribe_update::Update::MempoolTransaction(transaction)) = message.update else {
+            panic!("test update is a mempool transaction");
+        };
+        assert!(transaction.transaction.is_empty());
+        assert_eq!(transaction.transparent_inputs.len(), 1);
+        assert_eq!(transaction.transparent_outputs.len(), 1);
+        assert_eq!(
+            transaction.payload,
+            TransactionPayload::TransparentOnly as i32
+        );
     }
 
     #[tokio::test]

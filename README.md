@@ -154,6 +154,12 @@ cargo run -p zakura-grpc-client-example --bin client -- \
   --event transaction --filter-name transactions --reconnect
 ```
 
+Add `--transaction-payload meta-only` when only IDs, chain position, value
+totals, and feature flags are needed. `raw-only` keeps consensus bytes but
+omits decoded transparent inputs/outputs; `transparent-only` does the inverse.
+The default `full` representation preserves both. If several named filters
+match one update, the server returns the union needed by all matching filters.
+
 Stream complete transactions as soon as they enter this node's verified
 mempool (before they are mined):
 
@@ -331,6 +337,8 @@ delivery can set `ReplayGapPolicy::SkipToLive` in `ReconnectConfig`.
 - Full block payloads contain consensus-encoded Zcash block bytes.
 - Block filters can select metadata-only delivery, which keeps height, hash,
   receipt order, and finalization state while omitting raw block bytes.
+- Transaction filters can independently select full, metadata-only, raw-only,
+  or decoded-transparent-only payloads for mined and mempool transactions.
 - Transaction payloads contain consensus-encoded transaction bytes, txid,
   unmined ID, optional ZIP-244 auth digest, block position, commitment, and
   decoded transparent inputs/outputs. Recognized P2PKH/P2SH outputs include

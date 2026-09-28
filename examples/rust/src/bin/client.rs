@@ -6,7 +6,7 @@ use zakura_grpc_client::{ReconnectConfig, ZakuraGrpcClient};
 use zakura_grpc_proto::geyser::{
     subscribe_update, transparent_input, utxo_change, BlockCommitment, BlockPayload, EventType,
     MempoolTransactionUpdate, Outpoint, SubscribeRequest, SubscribeRequestFilter, SubscribeUpdate,
-    TransactionUpdate, TransparentInput, TransparentOutput, UtxoUpdate,
+    TransactionPayload, TransactionUpdate, TransparentInput, TransparentOutput, UtxoUpdate,
 };
 
 #[derive(Debug, Parser)]
@@ -102,6 +102,9 @@ struct SubscribeArgs {
     /// Select full block bytes or metadata-only block updates.
     #[arg(long, value_enum, requires = "filter_name")]
     block_payload: Option<BlockPayloadArg>,
+    /// Select full, metadata, raw-byte, or decoded-transparent transaction payloads.
+    #[arg(long, value_enum, requires = "filter_name")]
+    transaction_payload: Option<TransactionPayloadArg>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -130,6 +133,25 @@ impl From<BlockPayloadArg> for BlockPayload {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TransactionPayloadArg {
+    Full,
+    MetaOnly,
+    RawOnly,
+    TransparentOnly,
+}
+
+impl From<TransactionPayloadArg> for TransactionPayload {
+    fn from(value: TransactionPayloadArg) -> Self {
+        match value {
+            TransactionPayloadArg::Full => Self::Full,
+            TransactionPayloadArg::MetaOnly => Self::MetaOnly,
+            TransactionPayloadArg::RawOnly => Self::RawOnly,
+            TransactionPayloadArg::TransparentOnly => Self::TransparentOnly,
+        }
+    }
+}
+
 impl From<EventArg> for EventType {
     fn from(value: EventArg) -> Self {
         match value {
@@ -142,6 +164,74 @@ impl From<EventArg> for EventType {
             EventArg::Utxo => Self::Utxo,
         }
     }
+}
+
+fn build_subscribe_request(args: SubscribeArgs) -> (SubscribeRequest, Option<usize>, bool) {
+    let SubscribeArgs {
+        from_height,
+        event,
+        max_updates,
+        reconnect,
+        filter_name,
+        min_height,
+        transaction_id,
+        address_include,
+        address_exclude,
+        address_required,
+        coinbase,
+        transaction_version,
+        has_transparent,
+        has_sapling,
+        has_orchard,
+        min_value_zat,
+        block_payload,
+        transaction_payload,
+    } = args;
+    let event_types: Vec<_> = event
+        .into_iter()
+        .map(EventType::from)
+        .map(Into::into)
+        .collect();
+    let (event_types, filters) = match filter_name {
+        Some(name) => (
+            Vec::new(),
+            HashMap::from([(
+                name,
+                SubscribeRequestFilter {
+                    event_types,
+                    min_height,
+                    transaction_ids: transaction_id,
+                    transparent_addresses: Vec::new(),
+                    address_include,
+                    address_exclude,
+                    address_required,
+                    coinbase,
+                    transaction_version,
+                    has_transparent,
+                    has_sapling,
+                    has_orchard,
+                    min_value_zat,
+                    block_payload: block_payload
+                        .map_or(BlockPayload::Unspecified, BlockPayload::from)
+                        .into(),
+                    transaction_payload: transaction_payload
+                        .map_or(TransactionPayload::Unspecified, TransactionPayload::from)
+                        .into(),
+                },
+            )]),
+        ),
+        None => (event_types, HashMap::new()),
+    };
+    (
+        SubscribeRequest {
+            event_types,
+            from_height,
+            filters,
+            ..SubscribeRequest::default()
+        },
+        max_updates,
+        reconnect,
+    )
 }
 
 #[tokio::main]
@@ -158,66 +248,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match args.command {
         Command::Subscribe(args) => {
-            let SubscribeArgs {
-                from_height,
-                event,
-                max_updates,
-                reconnect,
-                filter_name,
-                min_height,
-                transaction_id,
-                address_include,
-                address_exclude,
-                address_required,
-                coinbase,
-                transaction_version,
-                has_transparent,
-                has_sapling,
-                has_orchard,
-                min_value_zat,
-                block_payload,
-            } = *args;
+            let (request, max_updates, reconnect) = build_subscribe_request(*args);
             if reconnect {
                 builder = builder.set_reconnect_config(ReconnectConfig::default());
             }
-            let event_types: Vec<_> = event
-                .into_iter()
-                .map(EventType::from)
-                .map(Into::into)
-                .collect();
-            let (event_types, filters) = match filter_name {
-                Some(name) => (
-                    Vec::new(),
-                    HashMap::from([(
-                        name,
-                        SubscribeRequestFilter {
-                            event_types,
-                            min_height,
-                            transaction_ids: transaction_id,
-                            address_include,
-                            address_exclude,
-                            address_required,
-                            coinbase,
-                            transaction_version,
-                            has_transparent,
-                            has_sapling,
-                            has_orchard,
-                            min_value_zat,
-                            block_payload: block_payload
-                                .map_or(BlockPayload::Unspecified, BlockPayload::from)
-                                .into(),
-                            ..SubscribeRequestFilter::default()
-                        },
-                    )]),
-                ),
-                None => (event_types, HashMap::new()),
-            };
-            let request = SubscribeRequest {
-                event_types,
-                from_height,
-                filters,
-                ..SubscribeRequest::default()
-            };
             let mut client = builder.connect().await?;
             let (_requests, mut updates) = client.subscribe_with_request(request).await?;
             let mut received = 0usize;
@@ -371,7 +405,7 @@ fn print_transaction_update(
     transaction: &TransactionUpdate,
 ) {
     println!(
-        "sequence={} source_sequence={} event={} filters={:?} commitment={} network={} height={} block={} transaction_index={} transaction_id={} unmined_transaction_id={} auth_digest={} version={} lock_time={} lock_time_is_time={} expiry_height={:?} transaction_bytes={} coinbase={} has_transparent={} has_sapling={} has_orchard={} transparent_inputs={} transparent_outputs={} transparent_input_value_zat={:?} transparent_output_value_zat={}",
+        "sequence={} source_sequence={} event={} filters={:?} commitment={} network={} height={} block={} transaction_index={} transaction_id={} unmined_transaction_id={} auth_digest={} version={} lock_time={} lock_time_is_time={} expiry_height={:?} payload={} transaction_bytes={} coinbase={} has_transparent={} has_sapling={} has_orchard={} transparent_inputs={} transparent_outputs={} transparent_input_value_zat={:?} transparent_output_value_zat={}",
         update.sequence,
         update.source_sequence,
         event_type,
@@ -388,6 +422,7 @@ fn print_transaction_update(
         transaction.lock_time,
         transaction.lock_time_is_time,
         transaction.expiry_height,
+        transaction_payload_name(transaction.payload),
         transaction.transaction.len(),
         transaction.coinbase,
         transaction.has_transparent,
@@ -410,7 +445,7 @@ fn print_mempool_transaction_update(
     transaction: &MempoolTransactionUpdate,
 ) {
     println!(
-        "sequence={} source_sequence={} event={} filters={:?} network={} transaction_id={} unmined_transaction_id={} auth_digest={} version={} lock_time={} lock_time_is_time={} expiry_height={:?} transaction_bytes={} coinbase={} has_transparent={} has_sapling={} has_orchard={} transparent_inputs={} transparent_outputs={} transparent_input_value_zat={:?} transparent_output_value_zat={} miner_fee_zat={} admitted_at={:?} admitted_height={:?} conventional_actions={} unpaid_actions={} legacy_sigop_count={} p2sh_sigop_count={} fee_weight_ratio={}",
+        "sequence={} source_sequence={} event={} filters={:?} network={} transaction_id={} unmined_transaction_id={} auth_digest={} version={} lock_time={} lock_time_is_time={} expiry_height={:?} payload={} transaction_bytes={} coinbase={} has_transparent={} has_sapling={} has_orchard={} transparent_inputs={} transparent_outputs={} transparent_input_value_zat={:?} transparent_output_value_zat={} miner_fee_zat={} admitted_at={:?} admitted_height={:?} conventional_actions={} unpaid_actions={} legacy_sigop_count={} p2sh_sigop_count={} fee_weight_ratio={}",
         update.sequence,
         update.source_sequence,
         event_type,
@@ -423,6 +458,7 @@ fn print_mempool_transaction_update(
         transaction.lock_time,
         transaction.lock_time_is_time,
         transaction.expiry_height,
+        transaction_payload_name(transaction.payload),
         transaction.transaction.len(),
         transaction.coinbase,
         transaction.has_transparent,
@@ -491,6 +527,13 @@ fn commitment_name(commitment: i32) -> String {
 
 fn block_payload_name(payload: i32) -> String {
     BlockPayload::try_from(payload).map_or_else(
+        |_| payload.to_string(),
+        |payload| payload.as_str_name().to_owned(),
+    )
+}
+
+fn transaction_payload_name(payload: i32) -> String {
+    TransactionPayload::try_from(payload).map_or_else(
         |_| payload.to_string(),
         |payload| payload.as_str_name().to_owned(),
     )

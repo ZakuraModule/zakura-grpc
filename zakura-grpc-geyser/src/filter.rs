@@ -4,7 +4,7 @@ use tonic::Status;
 use zakura_chain::{transaction, transparent::Address};
 use zakura_grpc_proto::geyser::{
     best_chain_update, subscribe_update, transparent_input, utxo_change, BlockPayload, EventType,
-    SubscribeRequest, SubscribeRequestFilter, SubscribeUpdate,
+    SubscribeRequest, SubscribeRequestFilter, SubscribeUpdate, TransactionPayload,
 };
 
 use crate::{config::FilterLimits, event::block_height};
@@ -18,10 +18,11 @@ pub(crate) struct EventFilter {
     needs_addresses: bool,
 }
 
-/// Match attribution and the richest block representation requested by its filters.
+/// Match attribution and the richest representations requested by its filters.
 pub(crate) struct FilterMatch {
     pub(crate) names: Vec<String>,
     pub(crate) block_payload: BlockPayload,
+    pub(crate) transaction_payload: TransactionPayload,
 }
 
 impl EventFilter {
@@ -102,12 +103,18 @@ impl EventFilter {
         } else {
             BlockPayload::MetaOnly
         };
+        let transaction_payload = if self.default_all || legacy_matches {
+            TransactionPayload::Full
+        } else {
+            richest_transaction_payload(matched_named.iter().map(|(_, filter)| filter))
+        };
         Some(FilterMatch {
             names: matched_named
                 .into_iter()
                 .map(|(name, _)| name.clone())
                 .collect(),
             block_payload,
+            transaction_payload,
         })
     }
 }
@@ -127,6 +134,7 @@ struct CompiledFilter {
     has_orchard: Option<bool>,
     min_value_zat: Option<u64>,
     block_payload: BlockPayload,
+    transaction_payload: TransactionPayload,
 }
 
 impl CompiledFilter {
@@ -187,6 +195,13 @@ impl CompiledFilter {
                 filter.block_payload
             ))
         })?;
+        let transaction_payload = TransactionPayload::try_from(filter.transaction_payload)
+            .map_err(|_| {
+                Status::invalid_argument(format!(
+                    "unknown transaction payload mode {}",
+                    filter.transaction_payload
+                ))
+            })?;
 
         Ok(Self {
             kinds,
@@ -204,6 +219,14 @@ impl CompiledFilter {
             block_payload: match block_payload {
                 BlockPayload::Unspecified | BlockPayload::Full => BlockPayload::Full,
                 BlockPayload::MetaOnly => BlockPayload::MetaOnly,
+            },
+            transaction_payload: match transaction_payload {
+                TransactionPayload::Unspecified | TransactionPayload::Full => {
+                    TransactionPayload::Full
+                }
+                TransactionPayload::MetaOnly => TransactionPayload::MetaOnly,
+                TransactionPayload::RawOnly => TransactionPayload::RawOnly,
+                TransactionPayload::TransparentOnly => TransactionPayload::TransparentOnly,
             },
         })
     }
@@ -284,6 +307,30 @@ impl CompiledFilter {
                     .is_some_and(|value| value >= minimum)
                     || facts.transparent_output_value_zat >= minimum
             })
+    }
+}
+
+fn richest_transaction_payload<'a>(
+    filters: impl Iterator<Item = &'a CompiledFilter>,
+) -> TransactionPayload {
+    let mut raw = false;
+    let mut transparent = false;
+    for filter in filters {
+        match filter.transaction_payload {
+            TransactionPayload::Unspecified | TransactionPayload::Full => {
+                raw = true;
+                transparent = true;
+            }
+            TransactionPayload::MetaOnly => {}
+            TransactionPayload::RawOnly => raw = true,
+            TransactionPayload::TransparentOnly => transparent = true,
+        }
+    }
+    match (raw, transparent) {
+        (true, true) => TransactionPayload::Full,
+        (true, false) => TransactionPayload::RawOnly,
+        (false, true) => TransactionPayload::TransparentOnly,
+        (false, false) => TransactionPayload::MetaOnly,
     }
 }
 
@@ -920,6 +967,55 @@ mod tests {
             vec!["full-from-100".to_owned(), "meta".to_owned()]
         );
         assert_eq!(full.block_payload, BlockPayload::Full);
+    }
+
+    #[test]
+    fn transaction_payload_uses_the_union_of_matching_named_filters() {
+        let filter = EventFilter::new(
+            &SubscribeRequest {
+                filters: HashMap::from([
+                    (
+                        "raw".to_owned(),
+                        SubscribeRequestFilter {
+                            event_types: vec![EventType::Transaction.into()],
+                            transaction_payload: TransactionPayload::RawOnly.into(),
+                            ..SubscribeRequestFilter::default()
+                        },
+                    ),
+                    (
+                        "transparent-from-100".to_owned(),
+                        SubscribeRequestFilter {
+                            event_types: vec![EventType::Transaction.into()],
+                            min_height: Some(100),
+                            transaction_payload: TransactionPayload::TransparentOnly.into(),
+                            ..SubscribeRequestFilter::default()
+                        },
+                    ),
+                ]),
+                ..SubscribeRequest::default()
+            },
+            &FilterLimits::default(),
+        )
+        .unwrap();
+        let make_update = |height| SubscribeUpdate {
+            event_type: EventType::Transaction.into(),
+            update: Some(subscribe_update::Update::Transaction(TransactionUpdate {
+                height,
+                ..TransactionUpdate::default()
+            })),
+            ..SubscribeUpdate::default()
+        };
+
+        let raw = filter.matched(&make_update(99)).unwrap();
+        assert_eq!(raw.names, vec!["raw".to_owned()]);
+        assert_eq!(raw.transaction_payload, TransactionPayload::RawOnly);
+
+        let full = filter.matched(&make_update(100)).unwrap();
+        assert_eq!(
+            full.names,
+            vec!["raw".to_owned(), "transparent-from-100".to_owned()]
+        );
+        assert_eq!(full.transaction_payload, TransactionPayload::Full);
     }
 
     #[test]

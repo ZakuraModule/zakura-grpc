@@ -21,8 +21,8 @@ use zakura_grpc_proto::geyser::{
     best_chain_update, subscribe_update, transparent_input, utxo_change, BestChainGrow,
     BestChainReset, BestChainUpdate, BlockCommitment, BlockPayload, BlockUpdate, CanonicalBlock,
     EventType, MempoolAction, MempoolTransactionUpdate, MempoolUpdate, Outpoint, SubscribeUpdate,
-    TransactionUpdate, TransparentCoinbaseInput, TransparentInput, TransparentOutput,
-    TransparentPrevoutInput, UtxoChange, UtxoCreated, UtxoSpent, UtxoUpdate,
+    TransactionPayload, TransactionUpdate, TransparentCoinbaseInput, TransparentInput,
+    TransparentOutput, TransparentPrevoutInput, UtxoChange, UtxoCreated, UtxoSpent, UtxoUpdate,
 };
 
 pub(crate) fn encode_event(
@@ -218,6 +218,7 @@ fn encode_mempool_transaction_update(
             has_transparent: transaction.has_transparent_inputs_or_outputs(),
             has_sapling: transaction.has_sapling_shielded_data(),
             has_orchard: transaction.has_orchard_shielded_data(),
+            payload: TransactionPayload::Full.into(),
         }),
     ))
 }
@@ -348,6 +349,7 @@ fn encode_transaction_updates(
                 has_transparent: transaction.has_transparent_inputs_or_outputs(),
                 has_sapling: transaction.has_sapling_shielded_data(),
                 has_orchard: transaction.has_orchard_shielded_data(),
+                payload: TransactionPayload::Full.into(),
             }),
         ));
     }

@@ -66,12 +66,27 @@ message SubscribeRequestFilter {
   // Select raw full block bytes or metadata-only BlockUpdate payloads.
   // Unspecified preserves the full-block behavior of earlier clients.
   BlockPayload block_payload = 14;
+  // Select the transaction representation returned by transaction-scoped updates.
+  // Unspecified preserves the full transaction behavior of earlier clients.
+  TransactionPayload transaction_payload = 15;
 }
 
 enum BlockPayload {
   BLOCK_PAYLOAD_UNSPECIFIED = 0;
   BLOCK_PAYLOAD_META_ONLY = 1;
   BLOCK_PAYLOAD_FULL = 2;
+}
+
+enum TransactionPayload {
+  TRANSACTION_PAYLOAD_UNSPECIFIED = 0;
+  // Return consensus bytes and decoded transparent inputs/outputs.
+  TRANSACTION_PAYLOAD_FULL = 1;
+  // Return transaction metadata without consensus bytes or transparent details.
+  TRANSACTION_PAYLOAD_META_ONLY = 2;
+  // Return consensus bytes without decoded transparent inputs/outputs.
+  TRANSACTION_PAYLOAD_RAW_ONLY = 3;
+  // Return decoded transparent inputs/outputs without consensus bytes.
+  TRANSACTION_PAYLOAD_TRANSPARENT_ONLY = 4;
 }
 
 message SubscribeUpdate {
@@ -189,6 +204,7 @@ message TransactionUpdate {
   bool has_transparent = 19;
   bool has_sapling = 20;
   bool has_orchard = 21;
+  TransactionPayload payload = 22;
 }
 
 message MempoolTransactionUpdate {
@@ -220,6 +236,7 @@ message MempoolTransactionUpdate {
   bool has_transparent = 23;
   bool has_sapling = 24;
   bool has_orchard = 25;
+  TransactionPayload payload = 26;
 }
 
 message TransparentInput {
