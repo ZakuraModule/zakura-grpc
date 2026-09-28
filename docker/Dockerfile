@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
-# Build with the directory containing the sibling `zakura` and `zakura-grpc`
-# repositories as the context. docker-compose.yml configures that layout.
+# The default build context is this `zakura-grpc` repository. The `zakura`
+# source is supplied as a named Git context by docker-compose.yml.
 FROM rust:1.97.1-trixie AS builder
 
 RUN apt-get -qq update && \
@@ -9,11 +9,11 @@ RUN apt-get -qq update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-COPY zakura /src/zakura
-COPY zakura-grpc /src/zakura-grpc
+COPY --from=zakura . /src/zakura
+COPY . /src/zakura-grpc
 WORKDIR /src/zakura
-# The sibling workspaces do not share a lockfile until the gRPC crates are
-# published, so let Cargo reconcile Zakura's lockfile inside the build stage.
+# The workspaces do not share a lockfile until the gRPC crates are published,
+# so let Cargo reconcile Zakura's lockfile inside the build stage.
 RUN cargo build --release --package zakura --bin zakurad
 
 FROM debian:trixie-slim AS runtime
@@ -31,7 +31,7 @@ RUN apt-get -qq update && \
       ${USER} --disabled-password --gecos ""
 
 COPY --from=builder /src/zakura/target/release/zakurad /usr/local/bin/zakurad
-COPY zakura/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --from=zakura docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 EXPOSE 10000
 ENTRYPOINT ["entrypoint.sh"]

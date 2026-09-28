@@ -1,8 +1,10 @@
 services:
   zakura:
     build:
-      context: ..
-      dockerfile: zakura-grpc/docker/Dockerfile
+      context: .
+      dockerfile: docker/Dockerfile
+      additional_contexts:
+        zakura: https://github.com/ZakuraModule/zakura.git#feat/geyser-plugin-framework
     restart: unless-stopped
     environment:
       CONFIG_FILE_PATH: /etc/zakura/zakurad.toml

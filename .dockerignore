@@ -1,0 +1,10 @@
+.git
+.github
+.agents
+.codex
+target
+**/target
+**/node_modules
+**/__pycache__
+**/*.pyc
+.DS_Store

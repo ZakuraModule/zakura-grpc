@@ -48,19 +48,27 @@ git -C ../zakura switch feat/geyser-plugin-framework
 
 ## Container quickstart
 
-With the sibling repository layout above, build and start a Mainnet node with
-the gRPC plugin enabled:
+The container build only requires a local checkout of this repository. Docker
+Compose fetches the Zakura `feat/geyser-plugin-framework` branch directly from
+GitHub as a named BuildKit context:
+
+```sh
+git clone https://github.com/ZakuraModule/zakura-grpc.git
+cd zakura-grpc
+```
+
+Build and start a Mainnet node with the gRPC plugin enabled:
 
 ```sh
 docker compose up --build
 ```
 
-The example Compose file publishes gRPC on `127.0.0.1:10000`, persists node
-state in a named volume, and reads [docker/zakurad.toml](docker/zakurad.toml).
-The build context is intentionally the parent directory because `zakurad` and
-the plugin are currently sibling Rust workspaces. Stop it with
-`docker compose down`; add `-v` only when the persisted node state should also
-be deleted.
+The example Compose file requires Docker Compose 2.17 or newer, publishes gRPC
+on `127.0.0.1:10000`, persists node state in a named volume, and reads
+[docker/zakurad.toml](docker/zakurad.toml). Stop it with `docker compose down`;
+add `-v` only when the persisted node state should also be deleted. For a
+reproducible production build, replace the Zakura branch in
+`additional_contexts` with a full commit SHA.
 
 ## Node configuration
 
