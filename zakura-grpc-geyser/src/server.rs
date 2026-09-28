@@ -25,7 +25,7 @@ use zakura_grpc_proto::geyser::{
 };
 
 use crate::{
-    auth::{SubscriptionTracker, TokenAuth},
+    auth::{SubscriptionGuard, SubscriptionTracker, TokenAuth},
     config::{Config, FilterLimits},
     event::block_height,
     filter::EventFilter,
@@ -103,9 +103,19 @@ impl SharedState {
         // The sequence watermark removes the overlap without creating a gap.
         let receiver = self.live.subscribe();
         let replay_started = Instant::now();
-        let snapshot = self.replay.lock().snapshot(from_height)?;
+        let snapshot = self.replay.lock().snapshot(from_height);
         metrics::histogram!("plugin.grpc.replay.snapshot.duration")
             .record(replay_started.elapsed().as_secs_f64());
+        if from_height.is_some() {
+            let outcome = match &snapshot {
+                Ok(_) => "success",
+                Err(status) if status.code() == tonic::Code::OutOfRange => "gap",
+                Err(_) => "error",
+            };
+            metrics::counter!("plugin.grpc.replay.requests.total", "outcome" => outcome)
+                .increment(1);
+        }
+        let snapshot = snapshot?;
         metrics::histogram!("plugin.grpc.replay.snapshot.events")
             .record(usize_metric_value(snapshot.updates.len()));
         Ok((receiver, snapshot))
@@ -269,11 +279,21 @@ impl ReplayBuffer {
         if let Some(requested) = from_height {
             match self.first_available_height() {
                 Some(first_available) if requested < first_available => {
+                    metrics::counter!(
+                        "plugin.grpc.replay.gaps.total",
+                        "reason" => "evicted"
+                    )
+                    .increment(1);
                     return Err(Status::out_of_range(format!(
                         "events from height {requested} are not available; first available height is {first_available}"
                     )));
                 }
                 None => {
+                    metrics::counter!(
+                        "plugin.grpc.replay.gaps.total",
+                        "reason" => "empty_window"
+                    )
+                    .increment(1);
                     return Err(Status::out_of_range(format!(
                         "events from height {requested} are not available; the replay window is empty"
                     )));
@@ -357,7 +377,7 @@ fn usize_metric_value(value: usize) -> f64 {
     f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
-fn event_type_label(event_type: i32) -> &'static str {
+pub(crate) fn event_type_label(event_type: i32) -> &'static str {
     EventType::try_from(event_type)
         .unwrap_or(EventType::Unspecified)
         .as_str_name()
@@ -447,8 +467,136 @@ async fn receive_initial_filter(
         .message()
         .await?
         .ok_or_else(|| Status::invalid_argument("the first subscribe request is required"))?;
-    let filter = EventFilter::new(&request, limits)?;
+    let filter = EventFilter::new(&request, limits).inspect_err(|_status| {
+        metrics::counter!("plugin.grpc.filters.rejected.total", "phase" => "initial").increment(1);
+    })?;
     Ok((filter, request.from_height))
+}
+
+struct SubscriptionContext {
+    filter: EventFilter,
+    filter_limits: Arc<FilterLimits>,
+    ping_interval: Option<Duration>,
+    guard: SubscriptionGuard,
+}
+
+async fn subscription_ping_timer(period: Option<Duration>) -> Option<tokio::time::Interval> {
+    let mut timer = period.map(tokio::time::interval);
+    if let Some(interval) = timer.as_mut() {
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        interval.tick().await;
+    }
+    timer
+}
+
+fn record_disconnect(reason: &'static str) {
+    metrics::counter!("plugin.grpc.client_disconnects.total", "reason" => reason).increment(1);
+}
+
+async fn run_subscription(
+    mut inbound: Streaming<SubscribeRequest>,
+    mut live: broadcast::Receiver<Arc<PublishedUpdate>>,
+    replay: ReplaySnapshot,
+    outbound: mpsc::Sender<SubscribeResult>,
+    context: SubscriptionContext,
+) {
+    let SubscriptionContext {
+        mut filter,
+        filter_limits,
+        ping_interval: subscription_ping_interval,
+        guard: _subscription_guard,
+    } = context;
+    let disconnect_reason = 'subscription: {
+        for update in replay.updates {
+            if !send_filtered(&outbound, &filter, &update, "replay").await {
+                break 'subscription "response_closed";
+            }
+        }
+
+        let mut replay_watermark = replay.watermark;
+        let mut ping_interval = subscription_ping_timer(subscription_ping_interval).await;
+        let mut ping_id = -1i32;
+        let mut inbound_open = true;
+        loop {
+            tokio::select! {
+                request = inbound.message(), if inbound_open => {
+                    match request {
+                        Ok(Some(request)) => {
+                            if let Some(ping) = request.ping {
+                                if outbound.send(Ok(subscription_pong(ping.id))).await.is_err() {
+                                    break 'subscription "response_closed";
+                                }
+                            } else {
+                                match EventFilter::new(&request, &filter_limits) {
+                                    Ok(updated_filter) => filter = updated_filter,
+                                    Err(status) => {
+                                        metrics::counter!(
+                                            "plugin.grpc.filters.rejected.total",
+                                            "phase" => "update"
+                                        )
+                                        .increment(1);
+                                        let _ = outbound.send(Err(status)).await;
+                                        break 'subscription "invalid_filter";
+                                    }
+                                }
+                                if request.from_height.is_some() {
+                                    warn!("ignoring from_height on a non-initial subscription update");
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            inbound_open = false;
+                            debug!("gRPC subscriber closed its request stream; keeping response stream open");
+                        }
+                        Err(error) => {
+                            debug!(?error, "gRPC subscriber request stream failed");
+                            break 'subscription "request_error";
+                        }
+                    }
+                }
+                update = live.recv() => {
+                    match update {
+                        Ok(update) => {
+                            if update.message.sequence <= replay_watermark {
+                                continue;
+                            }
+                            replay_watermark = update.message.sequence;
+                            if !send_filtered(&outbound, &filter, &update, "live").await {
+                                break 'subscription "response_closed";
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            metrics::counter!("plugin.grpc.client_lagged.total").increment(1);
+                            metrics::counter!("plugin.grpc.client_lagged.events.total")
+                                .increment(skipped);
+                            let _ = outbound.try_send(Err(Status::resource_exhausted(format!(
+                                "subscriber lagged by {skipped} events; reconnect with from_height"
+                            ))));
+                            break 'subscription "broadcast_lag";
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            break 'subscription "server_closed";
+                        }
+                    }
+                }
+                () = async {
+                    match ping_interval.as_mut() {
+                        Some(interval) => {
+                            interval.tick().await;
+                        }
+                        None => pending::<()>().await,
+                    }
+                } => {
+                    match send_subscription_ping(&outbound, ping_id) {
+                        PingSend::Sent(next_ping_id) => ping_id = next_ping_id,
+                        PingSend::Skipped => {}
+                        PingSend::Closed => break 'subscription "response_closed",
+                    }
+                }
+            }
+        }
+    };
+    record_disconnect(disconnect_reason);
 }
 
 #[tonic::async_trait]
@@ -462,102 +610,26 @@ impl Geyser for GrpcService {
         self.auth.authorize(&request)?;
         let subscription_guard = self.subscriptions.acquire(&request)?;
         let mut inbound = request.into_inner();
-        let (mut filter, from_height) =
+        let (filter, from_height) =
             receive_initial_filter(&mut inbound, &self.filter_limits).await?;
-        let (mut live, replay) = self.state.subscribe(from_height)?;
+        let (live, replay) = self.state.subscribe(from_height)?;
         let (outbound_tx, outbound_rx) = mpsc::channel(self.state.client_channel_capacity);
         let filter_limits = Arc::clone(&self.filter_limits);
         let subscription_ping_interval = self.subscription_ping_interval;
 
         metrics::counter!("plugin.grpc.connections.total").increment(1);
-        tokio::spawn(async move {
-            let _subscription_guard = subscription_guard;
-            for update in replay.updates {
-                if !send_filtered(&outbound_tx, &filter, &update, "replay").await {
-                    return;
-                }
-            }
-
-            let mut replay_watermark = replay.watermark;
-            let mut ping_interval = subscription_ping_interval.map(tokio::time::interval);
-            if let Some(interval) = ping_interval.as_mut() {
-                interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                interval.tick().await;
-            }
-            let mut ping_id = -1i32;
-            let mut inbound_open = true;
-            loop {
-                tokio::select! {
-                    request = inbound.message(), if inbound_open => {
-                        match request {
-                            Ok(Some(request)) => {
-                                if let Some(ping) = request.ping {
-                                    if outbound_tx.send(Ok(subscription_pong(ping.id))).await.is_err() {
-                                        break;
-                                    }
-                                } else {
-                                    match EventFilter::new(&request, &filter_limits) {
-                                        Ok(updated_filter) => filter = updated_filter,
-                                        Err(status) => {
-                                            let _ = outbound_tx.send(Err(status)).await;
-                                            break;
-                                        }
-                                    }
-                                    if request.from_height.is_some() {
-                                        warn!("ignoring from_height on a non-initial subscription update");
-                                    }
-                                }
-                            }
-                            Ok(None) => {
-                                inbound_open = false;
-                                debug!("gRPC subscriber closed its request stream; keeping response stream open");
-                            }
-                            Err(error) => {
-                                debug!(?error, "gRPC subscriber request stream failed");
-                                break;
-                            }
-                        }
-                    }
-                    update = live.recv() => {
-                        match update {
-                            Ok(update) => {
-                                if update.message.sequence <= replay_watermark {
-                                    continue;
-                                }
-                                replay_watermark = update.message.sequence;
-                                if !send_filtered(&outbound_tx, &filter, &update, "live").await {
-                                    break;
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                                metrics::counter!("plugin.grpc.client_lagged.total").increment(1);
-                                metrics::counter!("plugin.grpc.client_lagged.events.total")
-                                    .increment(skipped);
-                                let _ = outbound_tx.try_send(Err(Status::resource_exhausted(format!(
-                                        "subscriber lagged by {skipped} events; reconnect with from_height"
-                                    ))));
-                                break;
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                    () = async {
-                        match ping_interval.as_mut() {
-                            Some(interval) => {
-                                interval.tick().await;
-                            }
-                            None => pending::<()>().await,
-                        }
-                    } => {
-                        match send_subscription_ping(&outbound_tx, ping_id) {
-                            PingSend::Sent(next_ping_id) => ping_id = next_ping_id,
-                            PingSend::Skipped => {}
-                            PingSend::Closed => break,
-                        }
-                    }
-                }
-            }
-        });
+        tokio::spawn(run_subscription(
+            inbound,
+            live,
+            replay,
+            outbound_tx,
+            SubscriptionContext {
+                filter,
+                filter_limits,
+                ping_interval: subscription_ping_interval,
+                guard: subscription_guard,
+            },
+        ));
 
         let stream: Self::SubscribeStream = Box::pin(ReceiverStream::new(outbound_rx));
         Ok(Response::new(stream))
@@ -611,6 +683,7 @@ async fn send_filtered(
     let available = outbound.capacity();
     let maximum = outbound.max_capacity();
     let used = maximum.saturating_sub(available);
+    metrics::histogram!("plugin.grpc.outbound.queue.depth").record(usize_metric_value(used));
     let utilization = if maximum == 0 {
         1.0
     } else {

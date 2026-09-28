@@ -282,11 +282,30 @@ and p50/p95/p99 event-to-client latency. Add `--gzip` to measure compression or
 `observed_at` timestamp, so replayed events intentionally include their time in
 the replay window.
 
+The plugin records metrics in Zakura's process-wide metrics recorder; it does
+not start a second Prometheus server. Build `zakurad` with its `prometheus`
+feature and enable the node endpoint in its config:
+
+```toml
+[metrics]
+endpoint_addr = "127.0.0.1:9999"
+```
+
+Then inspect the plugin series with:
+
+```sh
+curl -s http://127.0.0.1:9999/metrics | grep plugin_grpc
+```
+
 The plugin exports bounded-cardinality metrics for encode, publish, handler,
 filter, replay snapshot, replay lock, and outbound queue wait durations. Replay
-gauges report retained buckets, heights, events, and bytes; eviction counters
-are labeled by `height`, `events`, `bytes`, or `age`. Message byte counters are
-split by event and live/replay delivery.
+gauges report retained buckets, heights, events, and bytes; replay request and
+gap counters distinguish successful recovery, evicted history, and an empty
+window. Queue depth/utilization, rejected filter phase, connection disconnect
+reason, and build/schema version are also exposed. Eviction counters are
+labeled by `height`, `events`, `bytes`, or `age`; message byte counters are split
+by event and live/replay delivery. The Prometheus exporter converts dots in the
+Rust metric names to underscores.
 
 `from_height` is accepted on the initial subscription request. If the requested
 height has been evicted, the server returns `OUT_OF_RANGE`; clients can query

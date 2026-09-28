@@ -164,6 +164,13 @@ impl GeyserPlugin for GrpcPlugin {
             }
         }));
         self.shutdown = Some(shutdown);
+        metrics::gauge!(
+            "plugin.grpc.build.info",
+            "version" => env!("CARGO_PKG_VERSION"),
+            "interface_version" => zakura_geyser_plugin_interface::GEYSER_INTERFACE_VERSION.to_string(),
+            "event_schema_version" => zakura_geyser_plugin_interface::EVENT_SCHEMA_VERSION.to_string(),
+        )
+        .set(1.0);
         metrics::gauge!("plugin.grpc.ready").set(1.0);
         Ok(())
     }
@@ -194,7 +201,7 @@ impl GeyserPlugin for GrpcPlugin {
             update.sequence = self.next_sequence;
             metrics::counter!(
                 "plugin.grpc.updates.total",
-                "event" => update.event_type.to_string()
+                "event" => server::event_type_label(update.event_type)
             )
             .increment(1);
         }
