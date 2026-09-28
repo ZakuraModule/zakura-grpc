@@ -1,0 +1,9 @@
+yellowstone-grpc/
+yellowstone-grpc-kafka/
+zakura/.git/
+zakura/target/
+zakura-grpc/.git/
+zakura-grpc/target/
+zakura-grpc/examples/python/.venv/
+zakura-grpc/examples/python/generated/
+zakura-grpc/examples/typescript/node_modules/

@@ -28,6 +28,7 @@ use zakura_geyser_plugin_interface::{
     EventEnvelope, EventSubscriptions, GeyserPlugin, PluginError, PluginResult,
 };
 use zakura_geyser_plugin_manager::{PluginConfig, PluginRegistry};
+use zakura_grpc_proto::geyser::FILE_DESCRIPTOR_SET;
 
 /// Registers the `grpc` factory with a Zakura plugin registry.
 pub fn register(registry: &mut PluginRegistry) {
@@ -129,6 +130,13 @@ impl GeyserPlugin for GrpcPlugin {
         let server_shutdown = shutdown.clone();
         let service =
             GrpcService::new(Arc::clone(&self.state), &self.config).into_server(&self.config);
+        let reflection_service = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+            .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+            .build_v1()
+            .map_err(|error| {
+                PluginError::new(format!("failed to build gRPC reflection service: {error}"))
+            })?;
         let listen_addr = self.config.listen_addr;
         let adaptive_window = self.config.server_http2_adaptive_window;
         let keepalive_interval = self
@@ -153,6 +161,7 @@ impl GeyserPlugin for GrpcPlugin {
                 .initial_connection_window_size(connection_window)
                 .initial_stream_window_size(stream_window)
                 .add_service(health_service)
+                .add_service(reflection_service)
                 .add_service(service)
                 .serve_with_incoming_shutdown(
                     TcpListenerStream::new(listener),
@@ -231,5 +240,19 @@ impl GeyserPlugin for GrpcPlugin {
         metrics::gauge!("plugin.grpc.ready").set(0.0);
         info!("Zakura gRPC plugin stopped");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reflection_descriptors_build() {
+        tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+            .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+            .build_v1()
+            .expect("the generated Geyser and health descriptors are valid");
     }
 }

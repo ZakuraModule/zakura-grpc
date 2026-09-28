@@ -1,0 +1,58 @@
+[geyser]
+enabled = true
+shutdown_timeout = "5s"
+total_queue_bytes = 67108864
+
+[[geyser.plugins]]
+name = "grpc-main"
+kind = "grpc"
+required_at_startup = true
+failure_policy = "disable_plugin"
+
+[geyser.plugins.subscriptions]
+block_accepted = true
+best_chain = true
+finalized_blocks = true
+mempool = true
+
+[geyser.plugins.queue]
+capacity_events = 4096
+capacity_bytes = 67108864
+overflow = "disable_plugin"
+
+[geyser.plugins.plugin]
+listen_addr = "0.0.0.0:10000"
+transaction_updates = true
+mempool_transaction_updates = true
+utxo_updates = true
+replay_stored_blocks = 150
+replay_max_events = 250000
+replay_max_bytes = 536870912
+replay_max_age_seconds = 14400
+broadcast_capacity = 100000
+client_channel_capacity = 10000
+subscription_ping_interval_seconds = 15
+max_decoding_message_size = 4194304
+max_encoding_message_size = 52428800
+compression = { accept = ["gzip", "zstd"], send = ["gzip", "zstd"] }
+subscription_limit = 1000
+subscription_limit_enforce = false
+event_encoding_threads = 1
+parallel_encoding_min_transactions = 32
+server_http2_adaptive_window = true
+
+[geyser.plugins.plugin.filter_limits]
+max_named_filters = 32
+max_event_types = 7
+max_name_bytes = 128
+max_transaction_ids = 256
+transaction_id_reject = []
+max_transparent_addresses = 256
+transparent_address_reject = []
+max_address_include = 256
+address_include_reject = []
+max_address_exclude = 256
+address_exclude_reject = []
+max_address_required = 256
+address_required_reject = []
+allow_all = true

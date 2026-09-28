@@ -1,0 +1,16 @@
+services:
+  zakura:
+    build:
+      context: ..
+      dockerfile: zakura-grpc/docker/Dockerfile
+    restart: unless-stopped
+    environment:
+      CONFIG_FILE_PATH: /etc/zakura/zakurad.toml
+    ports:
+      - "127.0.0.1:10000:10000"
+    volumes:
+      - ./docker/zakurad.toml:/etc/zakura/zakurad.toml:ro
+      - zakura-state:/home/zakura/.cache/zakura
+
+volumes:
+  zakura-state:

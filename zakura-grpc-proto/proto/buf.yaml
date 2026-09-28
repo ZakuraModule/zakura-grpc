@@ -1,0 +1,11 @@
+version: v2
+lint:
+  use:
+    - STANDARD
+  except:
+    # These public v1 names predate Buf adoption and changing them would break clients.
+    - RPC_RESPONSE_STANDARD_NAME
+    - SERVICE_SUFFIX
+breaking:
+  use:
+    - FILE

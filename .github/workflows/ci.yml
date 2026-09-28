@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out zakura-grpc
+        uses: actions/checkout@v4
+        with:
+          path: zakura-grpc
+      - name: Check out Zakura sibling dependency
+        uses: actions/checkout@v4
+        with:
+          repository: ZakuraModule/zakura
+          ref: feat/geyser-plugin-framework
+          path: zakura
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.97 --profile minimal --component clippy,rustfmt
+      - name: Select Rust toolchain
+        run: rustup default 1.97
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+        working-directory: zakura-grpc
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        working-directory: zakura-grpc
+      - name: Run tests
+        run: cargo test --locked --workspace --all-targets
+        working-directory: zakura-grpc
+
+  protobuf:
+    name: Protobuf compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: bufbuild/buf-setup-action@v1
+      - name: Lint schema
+        run: buf lint zakura-grpc-proto/proto
+      - name: Reject breaking schema changes
+        if: github.event_name == 'pull_request'
+        run: >-
+          buf breaking zakura-grpc-proto/proto
+          --against '.git#branch=main,subdir=zakura-grpc-proto/proto'
+
+  typescript:
+    name: TypeScript quickstart
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: examples/typescript/package-lock.json
+      - run: npm ci
+      - run: npm run check
+
+  python:
+    name: Python quickstart
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: examples/python/requirements.txt
+      - run: python -m pip install -r requirements.txt
+      - run: ./generate.sh
+      - run: python -m py_compile client.py
+      - run: python client.py --help

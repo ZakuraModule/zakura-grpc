@@ -1,2 +1,5 @@
 /target
 .DS_Store
+examples/python/.venv/
+examples/python/generated/
+examples/typescript/node_modules/

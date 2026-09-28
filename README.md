@@ -8,6 +8,8 @@ zakura-grpc-proto       generated protobuf messages and gRPC services
 zakura-grpc-client      reusable Rust client and bidirectional subscription API
 zakura-grpc-geyser      in-process Zakura plugin and gRPC server
 examples/rust           command-line client examples
+examples/typescript     zero-codegen TypeScript quickstart
+examples/python         generated Python quickstart
 ```
 
 The plugin keeps a short, process-local replay window. Kafka and durable
@@ -32,13 +34,33 @@ accounts, and transaction notifications:
 ## Development layout
 
 Until the Zakura Geyser interface crates are published, clone both repositories
-as siblings:
+as siblings and use Zakura's `feat/geyser-plugin-framework` branch:
 
 ```text
 zakura/
 ├── zakura/
 └── zakura-grpc/
 ```
+
+```sh
+git -C ../zakura switch feat/geyser-plugin-framework
+```
+
+## Container quickstart
+
+With the sibling repository layout above, build and start a Mainnet node with
+the gRPC plugin enabled:
+
+```sh
+docker compose up --build
+```
+
+The example Compose file publishes gRPC on `127.0.0.1:10000`, persists node
+state in a named volume, and reads [docker/zakurad.toml](docker/zakurad.toml).
+The build context is intentionally the parent directory because `zakurad` and
+the plugin are currently sibling Rust workspaces. Stop it with
+`docker compose down`; add `-v` only when the persisted node state should also
+be deleted.
 
 ## Node configuration
 
@@ -122,6 +144,50 @@ encoding for block or mempool batches containing at least
 `parallel_encoding_min_transactions` transactions.
 
 ## Example client
+
+### Inspect the API with grpcurl
+
+The server publishes the Geyser and standard health descriptors through gRPC
+reflection, so `grpcurl` does not need a local copy of the protobuf files:
+
+```sh
+grpcurl -plaintext 127.0.0.1:10000 list
+grpcurl -plaintext -d '{}' \
+  127.0.0.1:10000 zakura.geyser.v1.Geyser/GetVersion
+grpcurl -plaintext -d '{}' \
+  127.0.0.1:10000 zakura.geyser.v1.Geyser/SubscribeReplayInfo
+```
+
+When authentication is enabled, add `-H 'x-token: replace-me'`. Reflection
+exposes service schemas, not node data, and the actual Geyser RPCs retain their
+normal authentication checks.
+
+### TypeScript
+
+The [TypeScript quickstart](examples/typescript/README.md) loads the canonical
+protobuf schema at runtime:
+
+```sh
+cd examples/typescript
+npm install
+npm run start -- subscribe --event transaction --event utxo
+```
+
+### Python
+
+The [Python quickstart](examples/python/README.md) generates local bindings from
+the same schema:
+
+```sh
+cd examples/python
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+./generate.sh
+python client.py subscribe --event transaction --event utxo
+```
+
+### Rust
 
 Inspect the retained replay range:
 
