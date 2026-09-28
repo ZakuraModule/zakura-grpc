@@ -143,6 +143,19 @@ Setting `replay_stored_blocks = 0` disables replay. Set
 encoding for block or mempool batches containing at least
 `parallel_encoding_min_transactions` transactions.
 
+Reconnect-capable clients remember the latest finalized `(height, block hash)`
+and send it as `SubscribeRequest.resume`. The server verifies that anchor before
+replay and emits `ReconnectUpdate.discarded_blocks` before replacement data, so
+applications can roll back non-finalized state explicitly. A missing anchor
+returns `OUT_OF_RANGE`; a retained height with a different finalized hash
+returns `FAILED_PRECONDITION` instead of silently joining another chain.
+
+Set `SubscribeRequest.include_mempool_snapshot` to bootstrap mempool state. The
+stream emits `MEMPOOL_SNAPSHOT_PHASE_BEGIN`, chunked snapshot updates, then
+`MEMPOOL_SNAPSHOT_PHASE_END`. Snapshot entries and subsequent deltas carry a
+monotonic `mempool_revision`; the server suppresses overlapping deltas at or
+below the captured revision.
+
 ## Example client
 
 ### Inspect the API with grpcurl
@@ -171,6 +184,7 @@ protobuf schema at runtime:
 cd examples/typescript
 npm install
 npm run start -- subscribe --event transaction --event utxo
+npm run start -- subscribe --event mempool-changed --mempool-snapshot
 ```
 
 ### Python
@@ -202,6 +216,13 @@ Replay from a retained height and continue following live events:
 cargo run -p zakura-grpc-client-example --bin client -- \
   --endpoint http://127.0.0.1:10000 subscribe \
   --from-height 1000000 --reconnect
+```
+
+Bootstrap the current mempool before following live changes:
+
+```sh
+cargo run -p zakura-grpc-client-example --bin client -- \
+  subscribe --event mempool-changed --mempool-snapshot
 ```
 
 Filter to finalized blocks only:

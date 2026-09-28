@@ -90,7 +90,9 @@ pub(crate) fn update_height(update: &SubscribeUpdate) -> Option<u32> {
         subscribe_update::Update::Mempool(_)
         | subscribe_update::Update::MempoolTransaction(_)
         | subscribe_update::Update::Ping(_)
-        | subscribe_update::Update::Pong(_) => None,
+        | subscribe_update::Update::Pong(_)
+        | subscribe_update::Update::Reconnect(_)
+        | subscribe_update::Update::MempoolSnapshot(_) => None,
     }
 }
 

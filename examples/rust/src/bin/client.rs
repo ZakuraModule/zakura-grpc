@@ -63,6 +63,9 @@ struct SubscribeArgs {
     /// Reconnect automatically and replay missed retained blocks.
     #[arg(long)]
     reconnect: bool,
+    /// Send a revisioned snapshot of the current mempool before live deltas.
+    #[arg(long)]
+    mempool_snapshot: bool,
     /// Optional named filter returned on matching updates.
     #[arg(long)]
     filter_name: Option<String>,
@@ -172,6 +175,7 @@ fn build_subscribe_request(args: SubscribeArgs) -> (SubscribeRequest, Option<usi
         event,
         max_updates,
         reconnect,
+        mempool_snapshot,
         filter_name,
         min_height,
         transaction_id,
@@ -227,6 +231,7 @@ fn build_subscribe_request(args: SubscribeArgs) -> (SubscribeRequest, Option<usi
             event_types,
             from_height,
             filters,
+            include_mempool_snapshot: mempool_snapshot,
             ..SubscribeRequest::default()
         },
         max_updates,
@@ -346,6 +351,16 @@ fn print_update(update: &SubscribeUpdate) {
         Some(subscribe_update::Update::Pong(pong)) => {
             println!("subscription_pong id={}", pong.id);
         }
+        Some(subscribe_update::Update::Reconnect(reconnect)) => println!(
+            "reconnect finalized_height={} finalized_hash={} discarded_blocks={}",
+            reconnect.finalized_height,
+            reconnect.finalized_block_hash,
+            reconnect.discarded_blocks.len()
+        ),
+        Some(subscribe_update::Update::MempoolSnapshot(snapshot)) => println!(
+            "mempool_snapshot phase={} revision={} transactions={}",
+            snapshot.phase, snapshot.revision, snapshot.transaction_count
+        ),
         None => println!(
             "sequence={} event={} payload=none",
             update.sequence, event_type

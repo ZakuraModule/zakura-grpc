@@ -236,6 +236,9 @@ pub struct SubscriptionSink {
     sender: mpsc::Sender<SubscribeRequest>,
 }
 
+// Preserve Tokio's useful SendError payload so callers can recover the request
+// which was not sent, even though SubscribeRequest contains rich reconnect state.
+#[allow(clippy::result_large_err)]
 impl SubscriptionSink {
     /// Replaces the active legacy event filter without starting another replay.
     pub async fn set_event_types(

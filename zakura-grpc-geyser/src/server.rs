@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     future::pending,
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -19,9 +19,11 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 use zakura_grpc_proto::geyser::{
     geyser_server::{Geyser, GeyserServer},
-    subscribe_update, BlockPayload, EventType, GetVersionRequest, GetVersionResponse, PingRequest,
-    PingUpdate, PongResponse, PongUpdate, SubscribeReplayInfoRequest, SubscribeReplayInfoResponse,
-    SubscribeRequest, SubscribeUpdate, TransactionPayload,
+    subscribe_update, BlockPayload, EventType, GetVersionRequest, GetVersionResponse,
+    MempoolAction, MempoolSnapshotPhase, MempoolSnapshotUpdate, MempoolUpdate, PingRequest,
+    PingUpdate, PongResponse, PongUpdate, ReconnectUpdate, ResumeCheckpoint,
+    SubscribeReplayInfoRequest, SubscribeReplayInfoResponse, SubscribeRequest, SubscribeUpdate,
+    TransactionPayload,
 };
 
 use crate::{
@@ -32,6 +34,7 @@ use crate::{
 };
 
 type SubscribeResult = Result<SubscribeUpdate, Status>;
+const MEMPOOL_SNAPSHOT_IDS_PER_UPDATE: usize = 1_000;
 
 #[derive(Debug)]
 struct PreparedPayload {
@@ -115,7 +118,9 @@ impl PublishedUpdate {
                 | subscribe_update::Update::Mempool(_)
                 | subscribe_update::Update::Utxo(_)
                 | subscribe_update::Update::Ping(_)
-                | subscribe_update::Update::Pong(_),
+                | subscribe_update::Update::Pong(_)
+                | subscribe_update::Update::Reconnect(_)
+                | subscribe_update::Update::MempoolSnapshot(_),
             )
             | None => return (&self.message, self.encoded_len),
         };
@@ -137,6 +142,7 @@ impl PublishedUpdate {
 pub(crate) struct SharedState {
     live: broadcast::Sender<Arc<PublishedUpdate>>,
     replay: Mutex<ReplayBuffer>,
+    mempool: Mutex<MempoolState>,
     client_channel_capacity: usize,
 }
 
@@ -151,16 +157,31 @@ impl SharedState {
                 byte_capacity: config.replay_max_bytes,
                 max_age: config.replay_max_age_seconds.map(Duration::from_secs),
             })),
+            mempool: Mutex::new(MempoolState::default()),
             client_channel_capacity: config.client_channel_capacity,
         }
     }
 
-    pub(crate) fn publish_batch(&self, updates: Vec<SubscribeUpdate>) {
+    pub(crate) fn publish_batch(&self, mut updates: Vec<SubscribeUpdate>) {
+        let is_mempool_batch = updates.iter().any(is_mempool_update);
+        let mut mempool = is_mempool_batch.then(|| self.mempool.lock());
+        if let Some(mempool) = mempool.as_mut() {
+            mempool.revision = mempool.revision.saturating_add(1);
+            for update in &mut updates {
+                if is_mempool_update(update) {
+                    update.mempool_revision = Some(mempool.revision);
+                }
+            }
+        }
         let updates: Vec<_> = updates
             .into_iter()
             .map(PublishedUpdate::new)
             .map(Arc::new)
             .collect();
+
+        if let Some(mempool) = mempool.as_mut() {
+            mempool.apply(&updates);
+        }
 
         let replay_lock_started = Instant::now();
         self.replay.lock().push_batch(&updates);
@@ -175,20 +196,24 @@ impl SharedState {
             .increment(u64::try_from(update.encoded_len).unwrap_or(u64::MAX));
             let _ = self.live.send(update);
         }
+        drop(mempool);
         let subscriber_count = self.live.receiver_count();
         let subscriber_count = u32::try_from(subscriber_count).unwrap_or(u32::MAX);
         metrics::gauge!("plugin.grpc.subscribers").set(f64::from(subscriber_count));
     }
 
-    fn subscribe(
-        &self,
-        from_height: Option<u32>,
-    ) -> Result<(broadcast::Receiver<Arc<PublishedUpdate>>, ReplaySnapshot), Status> {
+    fn subscribe(&self, request: &SubscribeRequest) -> Result<InitialSubscription, Status> {
         // Subscribe first so events racing with the snapshot remain in the live ring.
         // The sequence watermark removes the overlap without creating a gap.
         let receiver = self.live.subscribe();
         let replay_started = Instant::now();
-        let snapshot = self.replay.lock().snapshot(from_height);
+        let from_height = replay_height(request)?;
+        let mut replay = self.replay.lock();
+        if let Some(checkpoint) = request.resume.as_ref() {
+            replay.verify_checkpoint(checkpoint)?;
+        }
+        let snapshot = replay.snapshot(from_height);
+        drop(replay);
         metrics::histogram!("plugin.grpc.replay.snapshot.duration")
             .record(replay_started.elapsed().as_secs_f64());
         if from_height.is_some() {
@@ -200,10 +225,19 @@ impl SharedState {
             metrics::counter!("plugin.grpc.replay.requests.total", "outcome" => outcome)
                 .increment(1);
         }
-        let snapshot = snapshot?;
+        let replay = snapshot?;
         metrics::histogram!("plugin.grpc.replay.snapshot.events")
-            .record(usize_metric_value(snapshot.updates.len()));
-        Ok((receiver, snapshot))
+            .record(usize_metric_value(replay.updates.len()));
+        let mempool = request
+            .include_mempool_snapshot
+            .then(|| self.mempool.lock().snapshot());
+        let reconnect = request.resume.as_ref().map(reconnect_update);
+        Ok(InitialSubscription {
+            live: receiver,
+            replay,
+            mempool,
+            reconnect,
+        })
     }
 
     fn replay_info(&self) -> SubscribeReplayInfoResponse {
@@ -231,6 +265,151 @@ impl SharedState {
             replay_ready: first_update.is_some(),
         }
     }
+}
+
+fn replay_height(request: &SubscribeRequest) -> Result<Option<u32>, Status> {
+    let Some(checkpoint) = request.resume.as_ref() else {
+        return Ok(request.from_height);
+    };
+    if checkpoint.finalized_block_hash.is_empty() {
+        return Err(Status::invalid_argument(
+            "resume.finalized_block_hash must not be empty",
+        ));
+    }
+    if request
+        .from_height
+        .is_some_and(|height| height != checkpoint.finalized_height)
+    {
+        return Err(Status::invalid_argument(
+            "from_height must equal resume.finalized_height when both are set",
+        ));
+    }
+    if checkpoint
+        .partial_blocks
+        .iter()
+        .any(|block| block.height <= checkpoint.finalized_height)
+    {
+        return Err(Status::invalid_argument(
+            "resume.partial_blocks must be above the finalized checkpoint",
+        ));
+    }
+    Ok(Some(checkpoint.finalized_height))
+}
+
+fn reconnect_update(checkpoint: &ResumeCheckpoint) -> SubscribeUpdate {
+    SubscribeUpdate {
+        event_type: EventType::Unspecified.into(),
+        update: Some(subscribe_update::Update::Reconnect(ReconnectUpdate {
+            finalized_height: checkpoint.finalized_height,
+            finalized_block_hash: checkpoint.finalized_block_hash.clone(),
+            discarded_blocks: checkpoint.partial_blocks.clone(),
+        })),
+        ..SubscribeUpdate::default()
+    }
+}
+
+fn is_mempool_update(update: &SubscribeUpdate) -> bool {
+    matches!(
+        update.update,
+        Some(
+            subscribe_update::Update::Mempool(_) | subscribe_update::Update::MempoolTransaction(_)
+        )
+    )
+}
+
+#[derive(Debug, Default)]
+struct MempoolState {
+    revision: u64,
+    entries: BTreeMap<String, Option<Arc<PublishedUpdate>>>,
+    summary_template: Option<SubscribeUpdate>,
+}
+
+impl MempoolState {
+    fn apply(&mut self, updates: &[Arc<PublishedUpdate>]) {
+        for update in updates {
+            match update.message.update.as_ref() {
+                Some(subscribe_update::Update::Mempool(change)) => {
+                    self.summary_template = Some(update.message.clone());
+                    match MempoolAction::try_from(change.action)
+                        .unwrap_or(MempoolAction::Unspecified)
+                    {
+                        MempoolAction::Added => {
+                            for transaction_id in &change.transaction_ids {
+                                self.entries.entry(transaction_id.clone()).or_default();
+                            }
+                        }
+                        MempoolAction::Invalidated | MempoolAction::Mined => {
+                            for transaction_id in &change.transaction_ids {
+                                self.entries.remove(transaction_id);
+                            }
+                        }
+                        MempoolAction::Unspecified => {}
+                    }
+                }
+                Some(subscribe_update::Update::MempoolTransaction(transaction)) => {
+                    let transaction_id = if transaction.unmined_transaction_id.is_empty() {
+                        &transaction.transaction_id
+                    } else {
+                        &transaction.unmined_transaction_id
+                    };
+                    self.entries
+                        .insert(transaction_id.clone(), Some(Arc::clone(update)));
+                }
+                _ => {}
+            }
+        }
+        metrics::gauge!("plugin.grpc.mempool.snapshot.transactions")
+            .set(usize_metric_value(self.entries.len()));
+    }
+
+    fn snapshot(&self) -> MempoolSnapshot {
+        let transaction_count = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+        let mut updates = Vec::with_capacity(self.entries.len().saturating_add(1));
+        if !self.entries.is_empty() {
+            let transaction_ids: Vec<_> = self.entries.keys().cloned().collect();
+            for chunk in transaction_ids.chunks(MEMPOOL_SNAPSHOT_IDS_PER_UPDATE) {
+                let mut summary = self.summary_template.clone().unwrap_or_default();
+                summary.event_type = EventType::MempoolChanged.into();
+                summary.filters.clear();
+                summary.mempool_revision = Some(self.revision);
+                summary.update = Some(subscribe_update::Update::Mempool(MempoolUpdate {
+                    action: MempoolAction::Added.into(),
+                    transaction_ids: chunk.to_vec(),
+                }));
+                updates.push(Arc::new(PublishedUpdate::new(summary)));
+            }
+            updates.extend(
+                self.entries
+                    .values()
+                    .filter_map(Option::as_ref)
+                    .map(|update| {
+                        let mut message = update.message.clone();
+                        message.mempool_revision = Some(self.revision);
+                        Arc::new(PublishedUpdate::new(message))
+                    }),
+            );
+        }
+        metrics::counter!("plugin.grpc.mempool.snapshots.total").increment(1);
+        MempoolSnapshot {
+            revision: self.revision,
+            transaction_count,
+            updates,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MempoolSnapshot {
+    revision: u64,
+    transaction_count: u64,
+    updates: Vec<Arc<PublishedUpdate>>,
+}
+
+struct InitialSubscription {
+    live: broadcast::Receiver<Arc<PublishedUpdate>>,
+    replay: ReplaySnapshot,
+    mempool: Option<MempoolSnapshot>,
+    reconnect: Option<SubscribeUpdate>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -403,6 +582,44 @@ impl ReplayBuffer {
         Ok(ReplaySnapshot { updates, watermark })
     }
 
+    fn verify_checkpoint(&self, checkpoint: &ResumeCheckpoint) -> Result<(), Status> {
+        let available = self.buckets.iter().any(|bucket| {
+            bucket.height == checkpoint.finalized_height
+                && bucket.updates.iter().any(|update| {
+                    matches!(
+                        update.message.update.as_ref(),
+                        Some(subscribe_update::Update::Block(block))
+                            if block.finalized && block.hash == checkpoint.finalized_block_hash
+                    )
+                })
+        });
+        if available {
+            metrics::counter!("plugin.grpc.replay.checkpoints.total", "outcome" => "verified")
+                .increment(1);
+            return Ok(());
+        }
+
+        let height_retained = self
+            .buckets
+            .iter()
+            .any(|bucket| bucket.height == checkpoint.finalized_height);
+        if height_retained {
+            metrics::counter!("plugin.grpc.replay.checkpoints.total", "outcome" => "hash_mismatch")
+                .increment(1);
+            Err(Status::failed_precondition(format!(
+                "finalized checkpoint hash mismatch at height {}",
+                checkpoint.finalized_height
+            )))
+        } else {
+            metrics::counter!("plugin.grpc.replay.checkpoints.total", "outcome" => "unavailable")
+                .increment(1);
+            Err(Status::out_of_range(format!(
+                "finalized checkpoint at height {} is not retained",
+                checkpoint.finalized_height
+            )))
+        }
+    }
+
     fn first_hash(&self) -> Option<String> {
         let height = self.first_available_height()?;
         self.buckets
@@ -448,7 +665,9 @@ fn update_block_hash(update: &SubscribeUpdate) -> Option<String> {
         subscribe_update::Update::Mempool(_)
         | subscribe_update::Update::MempoolTransaction(_)
         | subscribe_update::Update::Ping(_)
-        | subscribe_update::Update::Pong(_) => None,
+        | subscribe_update::Update::Pong(_)
+        | subscribe_update::Update::Reconnect(_)
+        | subscribe_update::Update::MempoolSnapshot(_) => None,
     }
 }
 
@@ -478,6 +697,25 @@ fn subscription_pong(id: i32) -> SubscribeUpdate {
     SubscribeUpdate {
         event_type: EventType::Unspecified.into(),
         update: Some(subscribe_update::Update::Pong(PongUpdate { id })),
+        ..SubscribeUpdate::default()
+    }
+}
+
+fn mempool_snapshot_marker(
+    revision: u64,
+    transaction_count: u64,
+    phase: MempoolSnapshotPhase,
+) -> SubscribeUpdate {
+    SubscribeUpdate {
+        event_type: EventType::Unspecified.into(),
+        mempool_revision: Some(revision),
+        update: Some(subscribe_update::Update::MempoolSnapshot(
+            MempoolSnapshotUpdate {
+                phase: phase.into(),
+                revision,
+                transaction_count,
+            },
+        )),
         ..SubscribeUpdate::default()
     }
 }
@@ -547,7 +785,7 @@ impl GrpcService {
 async fn receive_initial_filter(
     inbound: &mut Streaming<SubscribeRequest>,
     limits: &FilterLimits,
-) -> Result<(EventFilter, Option<u32>), Status> {
+) -> Result<(EventFilter, SubscribeRequest), Status> {
     let request = inbound
         .message()
         .await?
@@ -555,7 +793,7 @@ async fn receive_initial_filter(
     let filter = EventFilter::new(&request, limits).inspect_err(|_status| {
         metrics::counter!("plugin.grpc.filters.rejected.total", "phase" => "initial").increment(1);
     })?;
-    Ok((filter, request.from_height))
+    Ok((filter, request))
 }
 
 struct SubscriptionContext {
@@ -574,6 +812,75 @@ async fn subscription_ping_timer(period: Option<Duration>) -> Option<tokio::time
     timer
 }
 
+async fn send_initial_updates(
+    outbound: &mpsc::Sender<SubscribeResult>,
+    filter: &EventFilter,
+    replay: ReplaySnapshot,
+    mempool: Option<MempoolSnapshot>,
+    reconnect: Option<SubscribeUpdate>,
+) -> Option<(u64, Option<u64>)> {
+    if let Some(reconnect) = reconnect {
+        outbound.send(Ok(reconnect)).await.ok()?;
+    }
+
+    let mut mempool_watermark = None;
+    if let Some(snapshot) = mempool {
+        mempool_watermark = Some(snapshot.revision);
+        outbound
+            .send(Ok(mempool_snapshot_marker(
+                snapshot.revision,
+                snapshot.transaction_count,
+                MempoolSnapshotPhase::Begin,
+            )))
+            .await
+            .ok()?;
+        for update in snapshot.updates {
+            if !send_filtered(outbound, filter, &update, "mempool_snapshot").await {
+                return None;
+            }
+        }
+        outbound
+            .send(Ok(mempool_snapshot_marker(
+                snapshot.revision,
+                snapshot.transaction_count,
+                MempoolSnapshotPhase::End,
+            )))
+            .await
+            .ok()?;
+    }
+
+    let replay_watermark = replay.watermark;
+    for update in replay.updates {
+        if !send_filtered(outbound, filter, &update, "replay").await {
+            return None;
+        }
+    }
+    Some((replay_watermark, mempool_watermark))
+}
+
+fn apply_subscription_request(
+    filter: &mut EventFilter,
+    request: &SubscribeRequest,
+    limits: &FilterLimits,
+) -> Result<Option<SubscribeUpdate>, Status> {
+    if let Some(ping) = request.ping.as_ref() {
+        return Ok(Some(subscription_pong(ping.id)));
+    }
+    *filter = EventFilter::new(request, limits).inspect_err(|_status| {
+        metrics::counter!("plugin.grpc.filters.rejected.total", "phase" => "update").increment(1);
+    })?;
+    if request.from_height.is_some() {
+        warn!("ignoring from_height on a non-initial subscription update");
+    }
+    if request.resume.is_some() {
+        warn!("ignoring resume checkpoint on a non-initial subscription update");
+    }
+    if request.include_mempool_snapshot {
+        warn!("ignoring mempool snapshot request on a non-initial subscription update");
+    }
+    Ok(None)
+}
+
 fn record_disconnect(reason: &'static str) {
     metrics::counter!("plugin.grpc.client_disconnects.total", "reason" => reason).increment(1);
 }
@@ -582,6 +889,8 @@ async fn run_subscription(
     mut inbound: Streaming<SubscribeRequest>,
     mut live: broadcast::Receiver<Arc<PublishedUpdate>>,
     replay: ReplaySnapshot,
+    mempool: Option<MempoolSnapshot>,
+    reconnect: Option<SubscribeUpdate>,
     outbound: mpsc::Sender<SubscribeResult>,
     context: SubscriptionContext,
 ) {
@@ -592,13 +901,11 @@ async fn run_subscription(
         guard: _subscription_guard,
     } = context;
     let disconnect_reason = 'subscription: {
-        for update in replay.updates {
-            if !send_filtered(&outbound, &filter, &update, "replay").await {
-                break 'subscription "response_closed";
-            }
-        }
-
-        let mut replay_watermark = replay.watermark;
+        let Some((mut replay_watermark, mempool_watermark)) =
+            send_initial_updates(&outbound, &filter, replay, mempool, reconnect).await
+        else {
+            break 'subscription "response_closed";
+        };
         let mut ping_interval = subscription_ping_timer(subscription_ping_interval).await;
         let mut ping_id = -1i32;
         let mut inbound_open = true;
@@ -607,25 +914,14 @@ async fn run_subscription(
                 request = inbound.message(), if inbound_open => {
                     match request {
                         Ok(Some(request)) => {
-                            if let Some(ping) = request.ping {
-                                if outbound.send(Ok(subscription_pong(ping.id))).await.is_err() {
+                            match apply_subscription_request(&mut filter, &request, &filter_limits) {
+                                Ok(Some(response)) => if outbound.send(Ok(response)).await.is_err() {
                                     break 'subscription "response_closed";
-                                }
-                            } else {
-                                match EventFilter::new(&request, &filter_limits) {
-                                    Ok(updated_filter) => filter = updated_filter,
-                                    Err(status) => {
-                                        metrics::counter!(
-                                            "plugin.grpc.filters.rejected.total",
-                                            "phase" => "update"
-                                        )
-                                        .increment(1);
-                                        let _ = outbound.send(Err(status)).await;
-                                        break 'subscription "invalid_filter";
-                                    }
-                                }
-                                if request.from_height.is_some() {
-                                    warn!("ignoring from_height on a non-initial subscription update");
+                                },
+                                Ok(None) => {}
+                                Err(status) => {
+                                    let _ = outbound.send(Err(status)).await;
+                                    break 'subscription "invalid_filter";
                                 }
                             }
                         }
@@ -646,6 +942,14 @@ async fn run_subscription(
                                 continue;
                             }
                             replay_watermark = update.message.sequence;
+                            if mempool_watermark.is_some_and(|revision| {
+                                update
+                                    .message
+                                    .mempool_revision
+                                    .is_some_and(|update_revision| update_revision <= revision)
+                            }) {
+                                continue;
+                            }
                             if !send_filtered(&outbound, &filter, &update, "live").await {
                                 break 'subscription "response_closed";
                             }
@@ -695,9 +999,9 @@ impl Geyser for GrpcService {
         self.auth.authorize(&request)?;
         let subscription_guard = self.subscriptions.acquire(&request)?;
         let mut inbound = request.into_inner();
-        let (filter, from_height) =
+        let (filter, initial_request) =
             receive_initial_filter(&mut inbound, &self.filter_limits).await?;
-        let (live, replay) = self.state.subscribe(from_height)?;
+        let initial = self.state.subscribe(&initial_request)?;
         let (outbound_tx, outbound_rx) = mpsc::channel(self.state.client_channel_capacity);
         let filter_limits = Arc::clone(&self.filter_limits);
         let subscription_ping_interval = self.subscription_ping_interval;
@@ -705,8 +1009,10 @@ impl Geyser for GrpcService {
         metrics::counter!("plugin.grpc.connections.total").increment(1);
         tokio::spawn(run_subscription(
             inbound,
-            live,
-            replay,
+            initial.live,
+            initial.replay,
+            initial.mempool,
+            initial.reconnect,
             outbound_tx,
             SubscriptionContext {
                 filter,
@@ -858,7 +1164,9 @@ fn apply_payload_projection(
             | subscribe_update::Update::Mempool(_)
             | subscribe_update::Update::Utxo(_)
             | subscribe_update::Update::Ping(_)
-            | subscribe_update::Update::Pong(_),
+            | subscribe_update::Update::Pong(_)
+            | subscribe_update::Update::Reconnect(_)
+            | subscribe_update::Update::MempoolSnapshot(_),
         )
         | None => {}
     }
@@ -908,6 +1216,7 @@ mod tests {
             event_type: EventType::BlockFinalized.into(),
             update: Some(subscribe_update::Update::Block(BlockUpdate {
                 height,
+                hash: format!("hash-{height}"),
                 finalized: true,
                 ..BlockUpdate::default()
             })),
@@ -950,6 +1259,75 @@ mod tests {
 
         assert_eq!(status.code(), tonic::Code::OutOfRange);
         assert!(status.message().contains("replay window is empty"));
+    }
+
+    #[test]
+    fn replay_verifies_finalized_height_and_hash() {
+        let mut replay = ReplayBuffer::new(replay_limits(2));
+        replay.push_batch(&[published_block(20, 1)]);
+
+        replay
+            .verify_checkpoint(&ResumeCheckpoint {
+                finalized_height: 20,
+                finalized_block_hash: "hash-20".to_owned(),
+                partial_blocks: Vec::new(),
+            })
+            .unwrap();
+        let mismatch = replay
+            .verify_checkpoint(&ResumeCheckpoint {
+                finalized_height: 20,
+                finalized_block_hash: "other".to_owned(),
+                partial_blocks: Vec::new(),
+            })
+            .unwrap_err();
+        assert_eq!(mismatch.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn mempool_snapshot_tracks_additions_details_and_removals() {
+        let mut state = MempoolState {
+            revision: 1,
+            ..MempoolState::default()
+        };
+        let added = Arc::new(PublishedUpdate::new(SubscribeUpdate {
+            mempool_revision: Some(1),
+            update: Some(subscribe_update::Update::Mempool(MempoolUpdate {
+                action: MempoolAction::Added.into(),
+                transaction_ids: vec!["tx-a".to_owned(), "tx-b".to_owned()],
+            })),
+            ..SubscribeUpdate::default()
+        }));
+        let detail = Arc::new(PublishedUpdate::new(SubscribeUpdate {
+            mempool_revision: Some(1),
+            update: Some(subscribe_update::Update::MempoolTransaction(
+                MempoolTransactionUpdate {
+                    unmined_transaction_id: "tx-a".to_owned(),
+                    ..MempoolTransactionUpdate::default()
+                },
+            )),
+            ..SubscribeUpdate::default()
+        }));
+        state.apply(&[added, detail]);
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.transaction_count, 2);
+        assert_eq!(snapshot.updates.len(), 2);
+
+        state.revision = 2;
+        let removed = Arc::new(PublishedUpdate::new(SubscribeUpdate {
+            mempool_revision: Some(2),
+            update: Some(subscribe_update::Update::Mempool(MempoolUpdate {
+                action: MempoolAction::Mined.into(),
+                transaction_ids: vec!["tx-a".to_owned()],
+            })),
+            ..SubscribeUpdate::default()
+        }));
+        state.apply(&[removed]);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(snapshot.transaction_count, 1);
+        assert_eq!(snapshot.updates.len(), 1);
     }
 
     #[test]

@@ -515,7 +515,9 @@ fn update_matches_transaction_id(
         Some(
             subscribe_update::Update::Block(_)
             | subscribe_update::Update::Ping(_)
-            | subscribe_update::Update::Pong(_),
+            | subscribe_update::Update::Pong(_)
+            | subscribe_update::Update::Reconnect(_)
+            | subscribe_update::Update::MempoolSnapshot(_),
         )
         | None => false,
     }
@@ -574,7 +576,9 @@ fn update_transparent_addresses(update: &SubscribeUpdate) -> Option<Vec<&str>> {
             | subscribe_update::Update::BestChain(_)
             | subscribe_update::Update::Mempool(_)
             | subscribe_update::Update::Ping(_)
-            | subscribe_update::Update::Pong(_),
+            | subscribe_update::Update::Pong(_)
+            | subscribe_update::Update::Reconnect(_)
+            | subscribe_update::Update::MempoolSnapshot(_),
         )
         | None => None,
     }
@@ -619,7 +623,9 @@ fn update_transaction_facts(update: &SubscribeUpdate) -> Option<TransactionFacts
         | subscribe_update::Update::BestChain(_)
         | subscribe_update::Update::Mempool(_)
         | subscribe_update::Update::Ping(_)
-        | subscribe_update::Update::Pong(_) => None,
+        | subscribe_update::Update::Pong(_)
+        | subscribe_update::Update::Reconnect(_)
+        | subscribe_update::Update::MempoolSnapshot(_) => None,
     }
 }
 

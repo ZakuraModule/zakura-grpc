@@ -686,6 +686,7 @@ fn new_update(
         event_type: event_type.into(),
         filters: Vec::new(),
         source_sequence: metadata.source_sequence,
+        mempool_revision: None,
         update: Some(update),
     }
 }
@@ -773,7 +774,9 @@ pub(crate) fn block_height(update: &SubscribeUpdate) -> Option<u32> {
         subscribe_update::Update::Mempool(_)
         | subscribe_update::Update::MempoolTransaction(_)
         | subscribe_update::Update::Ping(_)
-        | subscribe_update::Update::Pong(_) => None,
+        | subscribe_update::Update::Pong(_)
+        | subscribe_update::Update::Reconnect(_)
+        | subscribe_update::Update::MempoolSnapshot(_) => None,
     }
 }
 

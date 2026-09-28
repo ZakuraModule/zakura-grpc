@@ -30,6 +30,19 @@ message SubscribeRequest {
   optional SubscribeRequestPing ping = 3;
   // Named filters let one update report every client filter it matched.
   map<string, SubscribeRequestFilter> filters = 4;
+  // A finalized chain anchor used to verify replay after reconnect. When set,
+  // the server replays from finalized_height and rejects a mismatching hash.
+  ResumeCheckpoint resume = 5;
+  // Sends a revisioned snapshot of the current mempool before live deltas.
+  bool include_mempool_snapshot = 6;
+}
+
+message ResumeCheckpoint {
+  uint32 finalized_height = 1;
+  string finalized_block_hash = 2;
+  // Non-finalized blocks already exposed to the application. They are echoed
+  // in ReconnectUpdate so the application can roll them back before replay.
+  repeated CanonicalBlock partial_blocks = 3;
 }
 
 message SubscribeRequestPing {
@@ -101,6 +114,8 @@ message SubscribeUpdate {
   // Sequence of the Zakura plugin event which produced this update. One block
   // event can produce a block update and multiple transaction/UTXO updates.
   uint64 source_sequence = 7;
+  // Monotonic revision for mempool snapshot entries and live mempool deltas.
+  optional uint64 mempool_revision = 8;
 
   oneof update {
     BlockUpdate block = 10;
@@ -111,7 +126,29 @@ message SubscribeUpdate {
     UtxoUpdate utxo = 15;
     MempoolTransactionUpdate mempool_transaction = 16;
     PingUpdate ping = 17;
+    ReconnectUpdate reconnect = 18;
+    MempoolSnapshotUpdate mempool_snapshot = 19;
   }
+}
+
+message ReconnectUpdate {
+  uint32 finalized_height = 1;
+  string finalized_block_hash = 2;
+  // Blocks the application must roll back, ordered from highest to lowest.
+  repeated CanonicalBlock discarded_blocks = 3;
+}
+
+enum MempoolSnapshotPhase {
+  MEMPOOL_SNAPSHOT_PHASE_UNSPECIFIED = 0;
+  MEMPOOL_SNAPSHOT_PHASE_BEGIN = 1;
+  MEMPOOL_SNAPSHOT_PHASE_END = 2;
+}
+
+message MempoolSnapshotUpdate {
+  MempoolSnapshotPhase phase = 1;
+  uint64 revision = 2;
+  // Total entries in the server snapshot before subscription filtering.
+  uint64 transaction_count = 3;
 }
 
 enum BlockCommitment {

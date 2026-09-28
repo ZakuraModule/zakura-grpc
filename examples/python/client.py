@@ -71,6 +71,7 @@ def subscribe(
 ) -> None:
     initial = geyser_pb2.SubscribeRequest(
         event_types=[EVENT_TYPES[event] for event in args.event],
+        include_mempool_snapshot=args.mempool_snapshot,
     )
     if args.from_height is not None:
         initial.from_height = args.from_height
@@ -131,6 +132,11 @@ def parser() -> argparse.ArgumentParser:
         help="event type to receive; repeat the option to select several",
     )
     stream.add_argument("--from-height", type=non_negative)
+    stream.add_argument(
+        "--mempool-snapshot",
+        action="store_true",
+        help="receive a revisioned mempool snapshot before live deltas",
+    )
     stream.add_argument("--max-updates", type=non_negative)
     return result
 

@@ -5,6 +5,7 @@ import {
   loadPackageDefinition,
   Metadata,
   ServiceError,
+  status,
 } from "@grpc/grpc-js";
 import { loadSync } from "@grpc/proto-loader";
 import { parseArgs } from "node:util";
@@ -31,13 +32,18 @@ interface GeyserConstructor {
 }
 
 interface ProtoRoot {
-  zakura: {
-    geyser: {
-      v1: {
-        Geyser: GeyserConstructor;
-      };
-    };
-  };
+  zakura: { geyser: { v1: { Geyser: GeyserConstructor } } };
+}
+
+interface CanonicalBlock {
+  height: number;
+  hash: string;
+  previousBlockHash: string;
+}
+
+interface FinalizedCheckpoint {
+  height: number;
+  hash: string;
 }
 
 const EVENT_NAMES: Record<string, string> = {
@@ -73,6 +79,8 @@ const { values, positionals } = parseArgs({
     "subscription-id": { type: "string", default: "zakura-typescript-example" },
     event: { type: "string", multiple: true },
     "from-height": { type: "string" },
+    "mempool-snapshot": { type: "boolean", default: false },
+    "max-retries": { type: "string", default: "8" },
   },
 });
 
@@ -88,9 +96,7 @@ const client = new root.zakura.geyser.v1.Geyser(
 );
 const metadata = new Metadata();
 const token = values["x-token"] ?? process.env.ZAKURA_GRPC_X_TOKEN;
-if (token !== undefined) {
-  metadata.set("x-token", token);
-}
+if (token !== undefined) metadata.set("x-token", token);
 metadata.set("x-subscription-id", values["subscription-id"]);
 
 function print(message: Message): void {
@@ -117,48 +123,263 @@ function unary(method: UnaryMethod): Promise<void> {
   });
 }
 
-function subscribe(): Promise<void> {
+function asMessage(value: unknown): Message | undefined {
+  return typeof value === "object" && value !== null
+    ? (value as Message)
+    : undefined;
+}
+
+function numberField(message: Message, name: string): number | undefined {
+  const value = message[name];
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isSafeInteger(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function stringField(message: Message, name: string): string | undefined {
+  const value = message[name];
+  return typeof value === "string" ? value : undefined;
+}
+
+class ResumeState {
+  finalized: FinalizedCheckpoint | undefined;
+  readonly partial = new Map<string, CanonicalBlock>();
+  latestHeight: number | undefined;
+  private readonly seen = new Set<string>();
+  private readonly seenByHeight = new Map<number, string[]>();
+
+  observe(update: Message): boolean {
+    const height = this.height(update);
+    if (height !== undefined) {
+      this.latestHeight = height;
+      const session = update.sessionId;
+      const sessionKey = Buffer.isBuffer(session) ? session.toString("hex") : String(session);
+      const key = `${sessionKey}:${String(update.sequence)}`;
+      if (this.seen.has(key)) return false;
+      this.seen.add(key);
+      const keys = this.seenByHeight.get(height) ?? [];
+      keys.push(key);
+      this.seenByHeight.set(height, keys);
+      while (this.seenByHeight.size > 250) {
+        const oldest = this.seenByHeight.keys().next().value as number | undefined;
+        if (oldest === undefined) break;
+        for (const oldKey of this.seenByHeight.get(oldest) ?? []) this.seen.delete(oldKey);
+        this.seenByHeight.delete(oldest);
+      }
+    }
+
+    const block = asMessage(update.block);
+    if (block !== undefined) {
+      const blockHeight = numberField(block, "height");
+      const hash = stringField(block, "hash");
+      if (blockHeight !== undefined && hash !== undefined) {
+        if (block.finalized === true) {
+          this.finalized = { height: blockHeight, hash };
+          for (const [key, partial] of this.partial) {
+            if (partial.height <= blockHeight) this.partial.delete(key);
+          }
+        } else {
+          this.addPartial({ height: blockHeight, hash, previousBlockHash: "" });
+        }
+      }
+    }
+
+    for (const field of ["transaction", "utxo"]) {
+      const payload = asMessage(update[field]);
+      if (payload === undefined) continue;
+      const blockHeight = numberField(payload, "height");
+      const hash = stringField(payload, "blockHash");
+      if (blockHeight === undefined || hash === undefined) continue;
+      if (payload.commitment === "BLOCK_COMMITMENT_FINALIZED") {
+        this.finalized = { height: blockHeight, hash };
+        for (const [key, partial] of this.partial) {
+          if (partial.height <= blockHeight) this.partial.delete(key);
+        }
+      } else {
+        this.addPartial({ height: blockHeight, hash, previousBlockHash: "" });
+      }
+    }
+
+    const bestChain = asMessage(update.bestChain);
+    if (bestChain !== undefined) {
+      const chainHeight = numberField(bestChain, "height");
+      const hash = stringField(bestChain, "hash");
+      const grow = asMessage(bestChain.grow);
+      if (chainHeight !== undefined && hash !== undefined && grow !== undefined) {
+        this.addPartial({
+          height: chainHeight,
+          hash,
+          previousBlockHash: stringField(grow, "previousBlockHash") ?? "",
+        });
+      }
+      const reset = asMessage(bestChain.reset);
+      if (reset !== undefined) {
+        for (const item of (reset.disconnectedBlocks as Message[] | undefined) ?? []) {
+          const h = numberField(item, "height");
+          const blockHash = stringField(item, "hash");
+          if (h !== undefined && blockHash !== undefined) this.partial.delete(`${h}:${blockHash}`);
+        }
+        for (const item of (reset.connectedBlocks as Message[] | undefined) ?? []) {
+          const h = numberField(item, "height");
+          const blockHash = stringField(item, "hash");
+          if (h !== undefined && blockHash !== undefined) {
+            this.addPartial({
+              height: h,
+              hash: blockHash,
+              previousBlockHash: stringField(item, "previousBlockHash") ?? "",
+            });
+          }
+        }
+      }
+    }
+
+    const reconnect = asMessage(update.reconnect);
+    for (const item of (reconnect?.discardedBlocks as Message[] | undefined) ?? []) {
+      const h = numberField(item, "height");
+      const hash = stringField(item, "hash");
+      if (h !== undefined && hash !== undefined) this.partial.delete(`${h}:${hash}`);
+    }
+    return true;
+  }
+
+  reconnectRequest(base: Message): Message {
+    const request: Message = { ...base };
+    if (this.finalized !== undefined) {
+      request.fromHeight = this.finalized.height;
+      request.resume = {
+        finalizedHeight: this.finalized.height,
+        finalizedBlockHash: this.finalized.hash,
+        partialBlocks: [...this.partial.values()].sort(
+          (left, right) => right.height - left.height,
+        ),
+      };
+    } else if (this.latestHeight !== undefined) {
+      request.fromHeight = Math.max(0, this.latestHeight - 2);
+    }
+    return request;
+  }
+
+  private addPartial(block: CanonicalBlock): void {
+    if (this.finalized === undefined || block.height > this.finalized.height) {
+      this.partial.set(`${block.height}:${block.hash}`, block);
+    }
+  }
+
+  private height(update: Message): number | undefined {
+    for (const field of ["block", "bestChain", "transaction", "utxo"]) {
+      const payload = asMessage(update[field]);
+      const height = payload === undefined ? undefined : numberField(payload, "height");
+      if (height !== undefined) return height;
+    }
+    return undefined;
+  }
+}
+
+function writeWithBackpressure(
+  stream: ClientDuplexStream<Message, Message>,
+  message: Message,
+): Promise<void> {
+  if (stream.write(message)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const cleanup = (): void => {
+      stream.off("drain", onDrain);
+      stream.off("error", onError);
+    };
+    const onDrain = (): void => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    stream.once("drain", onDrain);
+    stream.once("error", onError);
+  });
+}
+
+const RECOVERABLE = new Set([
+  status.CANCELLED,
+  status.UNKNOWN,
+  status.DEADLINE_EXCEEDED,
+  status.RESOURCE_EXHAUSTED,
+  status.ABORTED,
+  status.INTERNAL,
+  status.UNAVAILABLE,
+  status.DATA_LOSS,
+]);
+
+async function delay(milliseconds: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function subscribe(): Promise<void> {
   const eventTypes = (values.event ?? []).map((event) => {
     const normalized = EVENT_NAMES[event] ?? event;
-    if (!normalized.startsWith("EVENT_TYPE_")) {
-      throw new Error(`unknown event type: ${event}`);
-    }
+    if (!normalized.startsWith("EVENT_TYPE_")) throw new Error(`unknown event type: ${event}`);
     return normalized;
   });
-  const request: Message = { eventTypes };
+  const initial: Message = {
+    eventTypes,
+    includeMempoolSnapshot: values["mempool-snapshot"],
+  };
   if (values["from-height"] !== undefined) {
     const height = Number.parseInt(values["from-height"], 10);
     if (!Number.isSafeInteger(height) || height < 0) {
       throw new Error("--from-height must be a non-negative integer");
     }
-    request.fromHeight = height;
+    initial.fromHeight = height;
+  }
+  const maxRetries = Number.parseInt(values["max-retries"], 10);
+  if (!Number.isSafeInteger(maxRetries) || maxRetries < 0) {
+    throw new Error("--max-retries must be a non-negative integer");
   }
 
-  return new Promise((resolve, reject) => {
-    const stream = client.subscribe(metadata);
-    let stopping = false;
-    stream.on("data", (update: Message) => {
-      const ping = update.ping as { id?: number } | undefined;
-      if (ping?.id !== undefined) {
-        stream.write({ ping: { id: ping.id } });
-        return;
-      }
-      print(update);
-    });
-    stream.on("error", (error: ServiceError) => {
-      if (stopping) {
-        resolve();
-      } else {
-        reject(error);
-      }
-    });
-    stream.on("end", resolve);
-    process.once("SIGINT", () => {
-      stopping = true;
-      stream.cancel();
-    });
-    stream.write(request);
+  const state = new ResumeState();
+  let active: ClientDuplexStream<Message, Message> | undefined;
+  let stopping = false;
+  process.once("SIGINT", () => {
+    stopping = true;
+    active?.cancel();
   });
+
+  let reconnecting = false;
+  let attempt = 0;
+  while (!stopping) {
+    const stream = client.subscribe(metadata);
+    active = stream;
+    const request = reconnecting ? state.reconnectRequest(initial) : initial;
+    try {
+      await writeWithBackpressure(stream, request);
+      for await (const update of stream as AsyncIterable<Message>) {
+        attempt = 0;
+        const ping = asMessage(update.ping);
+        const pingId = ping === undefined ? undefined : numberField(ping, "id");
+        if (pingId !== undefined) {
+          await writeWithBackpressure(stream, { ping: { id: pingId } });
+          continue;
+        }
+        if (state.observe(update)) print(update);
+      }
+      if (stopping) return;
+      throw Object.assign(new Error("subscription ended"), { code: status.UNAVAILABLE });
+    } catch (error: unknown) {
+      if (stopping) return;
+      const serviceError = error as ServiceError;
+      if (!RECOVERABLE.has(serviceError.code) || attempt >= maxRetries) throw error;
+      const wait = Math.min(10_000, 100 * 2 ** attempt);
+      attempt += 1;
+      reconnecting = true;
+      console.error(`subscription disconnected; retrying in ${wait}ms`);
+      await delay(wait);
+    } finally {
+      stream.cancel();
+      if (active === stream) active = undefined;
+    }
+  }
 }
 
 async function main(): Promise<void> {

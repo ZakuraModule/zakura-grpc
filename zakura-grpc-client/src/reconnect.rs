@@ -1,11 +1,12 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Endpoint, Code, Status, Streaming};
 use tracing::warn;
 use zakura_grpc_proto::geyser::{
-    subscribe_update, SubscribeRequest, SubscribeRequestPing, SubscribeUpdate,
+    best_chain_update, subscribe_update, BlockCommitment, CanonicalBlock, ResumeCheckpoint,
+    SubscribeRequest, SubscribeRequestPing, SubscribeUpdate,
 };
 
 use crate::{
@@ -124,10 +125,123 @@ enum Disconnect {
     Status(Status),
 }
 
+#[derive(Debug, Default)]
+struct ChainResumeState {
+    finalized: Option<(u32, String)>,
+    partial: BTreeMap<(u32, String), CanonicalBlock>,
+}
+
+impl ChainResumeState {
+    fn from_request(request: &SubscribeRequest) -> Self {
+        let mut state = Self::default();
+        if let Some(checkpoint) = request.resume.as_ref() {
+            state.finalized = Some((
+                checkpoint.finalized_height,
+                checkpoint.finalized_block_hash.clone(),
+            ));
+            for block in &checkpoint.partial_blocks {
+                state
+                    .partial
+                    .insert((block.height, block.hash.clone()), block.clone());
+            }
+        }
+        state
+    }
+
+    fn observe(&mut self, update: &SubscribeUpdate) {
+        match update.update.as_ref() {
+            Some(subscribe_update::Update::Block(block)) if block.finalized => {
+                self.observe_block(block.height, block.hash.clone(), true);
+            }
+            Some(subscribe_update::Update::Block(block)) => {
+                self.observe_block(block.height, block.hash.clone(), false);
+            }
+            Some(subscribe_update::Update::BestChain(change)) => match change.change.as_ref() {
+                Some(best_chain_update::Change::Grow(grow)) => {
+                    self.insert_partial(CanonicalBlock {
+                        height: change.height,
+                        hash: change.hash.clone(),
+                        previous_block_hash: grow.previous_block_hash.clone(),
+                    });
+                }
+                Some(best_chain_update::Change::Reset(reset)) => {
+                    for block in &reset.disconnected_blocks {
+                        self.partial.remove(&(block.height, block.hash.clone()));
+                    }
+                    for block in &reset.connected_blocks {
+                        self.insert_partial(block.clone());
+                    }
+                }
+                None => {}
+            },
+            Some(subscribe_update::Update::Transaction(transaction)) => {
+                self.observe_block(
+                    transaction.height,
+                    transaction.block_hash.clone(),
+                    transaction.commitment == BlockCommitment::Finalized as i32,
+                );
+            }
+            Some(subscribe_update::Update::Utxo(utxo)) => {
+                self.observe_block(
+                    utxo.height,
+                    utxo.block_hash.clone(),
+                    utxo.commitment == BlockCommitment::Finalized as i32,
+                );
+            }
+            Some(subscribe_update::Update::Reconnect(reconnect)) => {
+                for block in &reconnect.discarded_blocks {
+                    self.partial.remove(&(block.height, block.hash.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn insert_partial(&mut self, block: CanonicalBlock) {
+        if self
+            .finalized
+            .as_ref()
+            .is_none_or(|(height, _)| block.height > *height)
+        {
+            self.partial
+                .insert((block.height, block.hash.clone()), block);
+        }
+    }
+
+    fn observe_block(&mut self, height: u32, hash: String, finalized: bool) {
+        if finalized {
+            self.finalized = Some((height, hash));
+            self.partial
+                .retain(|(partial_height, _), _| *partial_height > height);
+        } else {
+            self.insert_partial(CanonicalBlock {
+                height,
+                hash,
+                previous_block_hash: String::new(),
+            });
+        }
+    }
+
+    fn checkpoint(&self) -> Option<ResumeCheckpoint> {
+        let (finalized_height, finalized_block_hash) = self.finalized.as_ref()?;
+        Some(ResumeCheckpoint {
+            finalized_height: *finalized_height,
+            finalized_block_hash: finalized_block_hash.clone(),
+            partial_blocks: self.partial.values().rev().cloned().collect(),
+        })
+    }
+
+    fn clear(&mut self) {
+        self.finalized = None;
+        self.partial.clear();
+    }
+}
+
 async fn handle_update(
     active: &mut ActiveSubscription,
     output: &mpsc::Sender<Result<SubscribeUpdate, Status>>,
     checkpoint: &mut Option<u32>,
+    chain: &mut ChainResumeState,
     dedup: &mut Option<DedupState>,
     update: SubscribeUpdate,
 ) -> Result<Option<Disconnect>, ()> {
@@ -147,6 +261,7 @@ async fn handle_update(
         }
         Some(subscribe_update::Update::Pong(pong)) if pong.id < 0 => Ok(None),
         _ => {
+            chain.observe(&update);
             if let Some(height) = update_height(&update) {
                 *checkpoint = Some(height);
             }
@@ -198,6 +313,7 @@ async fn run_subscription(
 ) {
     let mut commands_open = true;
     let mut checkpoint = current_request.from_height;
+    let mut chain = ChainResumeState::from_request(&current_request);
     let mut dedup = reconnect.as_ref().and_then(|config| match config.policy {
         ReconnectionPolicy::SkipMissedData => None,
         ReconnectionPolicy::RecoverMissedData { height_retention } => {
@@ -210,6 +326,8 @@ async fn run_subscription(
             command = commands.recv(), if commands_open => if let Some(mut request) = command {
                 if request.ping.is_none() {
                     request.from_height = None;
+                    request.resume = None;
+                    request.include_mempool_snapshot = current_request.include_mempool_snapshot;
                     current_request = request.clone();
                 }
                 if active.requests.send(request).await.is_err() {
@@ -228,6 +346,7 @@ async fn run_subscription(
                     &mut active,
                     &output,
                     &mut checkpoint,
+                    &mut chain,
                     &mut dedup,
                     update,
                 ).await {
@@ -262,7 +381,9 @@ async fn run_subscription(
                     }
                     ReplayGapPolicy::SkipToLive => {
                         checkpoint = None;
+                        chain.clear();
                         current_request.from_height = None;
+                        current_request.resume = None;
                     }
                 }
             }
@@ -274,6 +395,7 @@ async fn run_subscription(
             &options,
             &mut current_request,
             &mut checkpoint,
+            &mut chain,
             config,
         )
         .await
@@ -299,15 +421,28 @@ async fn reconnect_subscription(
     options: &ClientOptions,
     current_request: &mut SubscribeRequest,
     checkpoint: &mut Option<u32>,
+    chain: &mut ChainResumeState,
     config: &ReconnectConfig,
 ) -> Result<ActiveSubscription, ZakuraGrpcClientError> {
     let mut reconnect_request = current_request.clone();
-    reconnect_request.from_height = match config.policy {
-        ReconnectionPolicy::SkipMissedData => None,
-        ReconnectionPolicy::RecoverMissedData { .. } => checkpoint
-            .map(|height| height.saturating_sub(config.checkpoint_height_buffer))
-            .or(current_request.from_height),
-    };
+    match config.policy {
+        ReconnectionPolicy::SkipMissedData => {
+            reconnect_request.from_height = None;
+            reconnect_request.resume = None;
+        }
+        ReconnectionPolicy::RecoverMissedData { .. } => {
+            reconnect_request.resume = chain.checkpoint();
+            reconnect_request.from_height = reconnect_request
+                .resume
+                .as_ref()
+                .map(|resume| resume.finalized_height)
+                .or_else(|| {
+                    checkpoint
+                        .map(|height| height.saturating_sub(config.checkpoint_height_buffer))
+                        .or(current_request.from_height)
+                });
+        }
+    }
 
     warn!(
         from_height = reconnect_request.from_height,
@@ -328,7 +463,9 @@ async fn reconnect_subscription(
     }
 
     *checkpoint = None;
+    chain.clear();
     current_request.from_height = None;
+    current_request.resume = None;
     reconnect_request.from_height = None;
     connect_with_backoff(
         endpoint,
@@ -419,6 +556,7 @@ const fn is_recoverable_status(code: Code) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zakura_grpc_proto::geyser::{BlockUpdate, ReconnectUpdate};
 
     #[test]
     fn retryable_codes_match_stream_failures() {
@@ -436,5 +574,42 @@ mod tests {
             ReconnectionPolicy::RecoverMissedData { .. }
         ));
         assert_eq!(config.replay_gap_policy, ReplayGapPolicy::Fail);
+    }
+
+    #[test]
+    fn chain_resume_anchors_at_finalized_hash_and_discards_partial_blocks() {
+        let mut chain = ChainResumeState::default();
+        chain.observe(&SubscribeUpdate {
+            update: Some(subscribe_update::Update::Block(BlockUpdate {
+                height: 100,
+                hash: "final".to_owned(),
+                finalized: true,
+                ..BlockUpdate::default()
+            })),
+            ..SubscribeUpdate::default()
+        });
+        chain.observe(&SubscribeUpdate {
+            update: Some(subscribe_update::Update::Block(BlockUpdate {
+                height: 101,
+                hash: "partial".to_owned(),
+                ..BlockUpdate::default()
+            })),
+            ..SubscribeUpdate::default()
+        });
+
+        let checkpoint = chain.checkpoint().unwrap();
+        assert_eq!(checkpoint.finalized_height, 100);
+        assert_eq!(checkpoint.finalized_block_hash, "final");
+        assert_eq!(checkpoint.partial_blocks.len(), 1);
+
+        chain.observe(&SubscribeUpdate {
+            update: Some(subscribe_update::Update::Reconnect(ReconnectUpdate {
+                finalized_height: 100,
+                finalized_block_hash: "final".to_owned(),
+                discarded_blocks: checkpoint.partial_blocks,
+            })),
+            ..SubscribeUpdate::default()
+        });
+        assert!(chain.partial.is_empty());
     }
 }

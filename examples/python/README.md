@@ -12,9 +12,11 @@ python -m pip install -r requirements.txt
 python client.py get-version
 python client.py replay-info
 python client.py subscribe --event transaction --event utxo
+python client.py subscribe --event mempool-changed --mempool-snapshot
 ```
 
 Use `--endpoint https://node.example:10000` for TLS and either
 `--x-token secret` or `ZAKURA_GRPC_X_TOKEN=secret` for authentication. Add
 `--from-height 1000000` to replay retained block-scoped events before following
-the live stream.
+the live stream. Add `--mempool-snapshot` to receive `BEGIN`, the current
+mempool contents, and `END` before revisioned live deltas.
