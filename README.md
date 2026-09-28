@@ -354,7 +354,10 @@ delivery can set `ReplayGapPolicy::SkipToLive` in `ReconnectConfig`.
   tells consumers to recover with historical backfill.
 - Binary protobuf fields use reference-counted buffers, so cloning an update for
   replay and multiple subscribers does not copy block, transaction, or script
-  bytes. Protobuf size is calculated once per update, replay stores event
+  bytes. Metadata-only block and projected transaction variants are prepared
+  lazily once per update and reused across subscribers; their protobuf size is
+  cached too. Cache hit/miss counts are exposed in
+  `plugin.grpc.payload_projection_cache.requests.total`. Replay stores event
   buckets, and transaction/UTXO views are produced in the same transaction
   pass. Slow subscribers reserve outbound capacity before cloning their view.
 

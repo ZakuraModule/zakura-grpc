@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     future::pending,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -19,8 +19,8 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 use zakura_grpc_proto::geyser::{
     geyser_server::{Geyser, GeyserServer},
-    subscribe_update, EventType, GetVersionRequest, GetVersionResponse, PingRequest, PingUpdate,
-    PongResponse, PongUpdate, SubscribeReplayInfoRequest, SubscribeReplayInfoResponse,
+    subscribe_update, BlockPayload, EventType, GetVersionRequest, GetVersionResponse, PingRequest,
+    PingUpdate, PongResponse, PongUpdate, SubscribeReplayInfoRequest, SubscribeReplayInfoResponse,
     SubscribeRequest, SubscribeUpdate, TransactionPayload,
 };
 
@@ -28,24 +28,109 @@ use crate::{
     auth::{SubscriptionGuard, SubscriptionTracker, TokenAuth},
     config::{Config, FilterLimits},
     event::block_height,
-    filter::{EventFilter, FilterMatch},
+    filter::EventFilter,
 };
 
 type SubscribeResult = Result<SubscribeUpdate, Status>;
 
 #[derive(Debug)]
-struct PublishedUpdate {
+struct PreparedPayload {
     message: SubscribeUpdate,
     encoded_len: usize,
 }
 
-impl PublishedUpdate {
-    fn new(message: SubscribeUpdate) -> Self {
+impl PreparedPayload {
+    fn new(
+        source: &SubscribeUpdate,
+        block_payload: BlockPayload,
+        transaction_payload: TransactionPayload,
+    ) -> Self {
+        let mut message = source.clone();
+        apply_payload_projection(&mut message, block_payload, transaction_payload);
         let encoded_len = message.encoded_len();
         Self {
             message,
             encoded_len,
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PayloadProjectionCache {
+    block_meta: OnceLock<PreparedPayload>,
+    transaction_meta: OnceLock<PreparedPayload>,
+    transaction_raw: OnceLock<PreparedPayload>,
+    transaction_transparent: OnceLock<PreparedPayload>,
+}
+
+#[derive(Debug)]
+struct PublishedUpdate {
+    message: SubscribeUpdate,
+    encoded_len: usize,
+    projections: PayloadProjectionCache,
+}
+
+impl PublishedUpdate {
+    fn new(mut message: SubscribeUpdate) -> Self {
+        debug_assert!(message.filters.is_empty());
+        apply_payload_projection(&mut message, BlockPayload::Full, TransactionPayload::Full);
+        let encoded_len = message.encoded_len();
+        Self {
+            message,
+            encoded_len,
+            projections: PayloadProjectionCache::default(),
+        }
+    }
+
+    fn payload(
+        &self,
+        block_payload: BlockPayload,
+        transaction_payload: TransactionPayload,
+    ) -> (&SubscribeUpdate, usize) {
+        let (cache, label) = match self.message.update.as_ref() {
+            Some(subscribe_update::Update::Block(_)) if block_payload == BlockPayload::MetaOnly => {
+                (&self.projections.block_meta, "block_meta")
+            }
+            Some(
+                subscribe_update::Update::Transaction(_)
+                | subscribe_update::Update::MempoolTransaction(_),
+            ) => match transaction_payload {
+                TransactionPayload::MetaOnly => {
+                    (&self.projections.transaction_meta, "transaction_meta")
+                }
+                TransactionPayload::RawOnly => {
+                    (&self.projections.transaction_raw, "transaction_raw")
+                }
+                TransactionPayload::TransparentOnly => (
+                    &self.projections.transaction_transparent,
+                    "transaction_transparent",
+                ),
+                TransactionPayload::Unspecified | TransactionPayload::Full => {
+                    return (&self.message, self.encoded_len);
+                }
+            },
+            Some(
+                subscribe_update::Update::Block(_)
+                | subscribe_update::Update::BestChain(_)
+                | subscribe_update::Update::Mempool(_)
+                | subscribe_update::Update::Utxo(_)
+                | subscribe_update::Update::Ping(_)
+                | subscribe_update::Update::Pong(_),
+            )
+            | None => return (&self.message, self.encoded_len),
+        };
+
+        let result = if cache.get().is_some() { "hit" } else { "miss" };
+        let prepared = cache.get_or_init(|| {
+            PreparedPayload::new(&self.message, block_payload, transaction_payload)
+        });
+        metrics::counter!(
+            "plugin.grpc.payload_projection_cache.requests.total",
+            "projection" => label,
+            "result" => result,
+        )
+        .increment(1);
+        (&prepared.message, prepared.encoded_len)
     }
 }
 
@@ -698,10 +783,12 @@ async fn send_filtered(
     metrics::histogram!("plugin.grpc.outbound.queue.wait.duration")
         .record(wait_started.elapsed().as_secs_f64());
 
-    let mut message = update.message.clone();
-    apply_payload_projection(&mut message, &filter_match);
+    let (prepared, prepared_len) =
+        update.payload(filter_match.block_payload, filter_match.transaction_payload);
+    let mut message = prepared.clone();
     message.filters = filter_match.names;
-    let encoded_len = message.encoded_len();
+    let encoded_len = prepared_len.saturating_add(encoded_filter_names_len(&message.filters));
+    debug_assert_eq!(encoded_len, message.encoded_len());
     permit.send(Ok(message));
     metrics::counter!(
         "plugin.grpc.messages_sent.total",
@@ -718,17 +805,21 @@ async fn send_filtered(
     true
 }
 
-fn apply_payload_projection(message: &mut SubscribeUpdate, filter_match: &FilterMatch) {
+fn apply_payload_projection(
+    message: &mut SubscribeUpdate,
+    block_payload: BlockPayload,
+    transaction_payload: TransactionPayload,
+) {
     match message.update.as_mut() {
         Some(subscribe_update::Update::Block(block)) => {
-            block.payload = filter_match.block_payload.into();
-            if filter_match.block_payload == zakura_grpc_proto::geyser::BlockPayload::MetaOnly {
+            block.payload = block_payload.into();
+            if block_payload == BlockPayload::MetaOnly {
                 block.block = Bytes::new();
             }
         }
         Some(subscribe_update::Update::Transaction(transaction)) => {
-            transaction.payload = filter_match.transaction_payload.into();
-            match filter_match.transaction_payload {
+            transaction.payload = transaction_payload.into();
+            match transaction_payload {
                 TransactionPayload::MetaOnly => {
                     transaction.transaction = Bytes::new();
                     transaction.transparent_inputs.clear();
@@ -745,8 +836,8 @@ fn apply_payload_projection(message: &mut SubscribeUpdate, filter_match: &Filter
             }
         }
         Some(subscribe_update::Update::MempoolTransaction(transaction)) => {
-            transaction.payload = filter_match.transaction_payload.into();
-            match filter_match.transaction_payload {
+            transaction.payload = transaction_payload.into();
+            match transaction_payload {
                 TransactionPayload::MetaOnly => {
                     transaction.transaction = Bytes::new();
                     transaction.transparent_inputs.clear();
@@ -771,6 +862,22 @@ fn apply_payload_projection(message: &mut SubscribeUpdate, filter_match: &Filter
         )
         | None => {}
     }
+}
+
+fn encoded_filter_names_len(names: &[String]) -> usize {
+    names
+        .iter()
+        .map(|name| 1 + encoded_varint_len(name.len()) + name.len())
+        .sum()
+}
+
+const fn encoded_varint_len(mut value: usize) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
 }
 
 pub(crate) async fn mark_serving(reporter: &mut tonic_health::server::HealthReporter) {
@@ -915,14 +1022,7 @@ mod tests {
                 })),
                 ..SubscribeUpdate::default()
             };
-            apply_payload_projection(
-                &mut message,
-                &FilterMatch {
-                    names: Vec::new(),
-                    block_payload: BlockPayload::Full,
-                    transaction_payload: payload,
-                },
-            );
+            apply_payload_projection(&mut message, BlockPayload::Full, payload);
 
             let Some(subscribe_update::Update::Transaction(transaction)) = message.update else {
                 panic!("test update is a transaction");
@@ -955,11 +1055,8 @@ mod tests {
         };
         apply_payload_projection(
             &mut message,
-            &FilterMatch {
-                names: Vec::new(),
-                block_payload: BlockPayload::Full,
-                transaction_payload: TransactionPayload::TransparentOnly,
-            },
+            BlockPayload::Full,
+            TransactionPayload::TransparentOnly,
         );
 
         let Some(subscribe_update::Update::MempoolTransaction(transaction)) = message.update else {
@@ -971,6 +1068,34 @@ mod tests {
         assert_eq!(
             transaction.payload,
             TransactionPayload::TransparentOnly as i32
+        );
+    }
+
+    #[test]
+    fn payload_projection_and_encoded_length_are_cached() {
+        let published = PublishedUpdate::new(SubscribeUpdate {
+            update: Some(subscribe_update::Update::Transaction(TransactionUpdate {
+                transaction: Bytes::from_static(&[1, 2, 3]),
+                transparent_inputs: vec![TransparentInput::default()],
+                transparent_outputs: vec![TransparentOutput::default()],
+                ..TransactionUpdate::default()
+            })),
+            ..SubscribeUpdate::default()
+        });
+        assert!(published.projections.transaction_raw.get().is_none());
+
+        let (first, first_len) = published.payload(BlockPayload::Full, TransactionPayload::RawOnly);
+        assert!(published.projections.transaction_raw.get().is_some());
+        let (second, second_len) =
+            published.payload(BlockPayload::Full, TransactionPayload::RawOnly);
+        assert!(std::ptr::eq(first, second));
+        assert_eq!(first_len, second_len);
+
+        let mut delivered = second.clone();
+        delivered.filters = vec!["wallet".to_owned(), "x".repeat(128)];
+        assert_eq!(
+            first_len + encoded_filter_names_len(&delivered.filters),
+            delivered.encoded_len()
         );
     }
 
